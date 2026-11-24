@@ -1,6 +1,7 @@
 package dev.hydro.j2c.preprocess;
 
 import dev.hydro.j2c.analysis.FrameAnalyzer;
+import dev.hydro.j2c.config.ObfuscationConfig;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.*;
@@ -14,13 +15,14 @@ import java.util.*;
  */
 public final class ConstructorOutliner {
 
-    public static void outlineConstructors(ClassNode cn, Set<MethodNode> outlinedTargets) {
+    public static void outlineConstructors(ClassNode cn, ObfuscationConfig config, Set<MethodNode> outlinedTargets) {
         if ((cn.access & Opcodes.ACC_INTERFACE) != 0) return;
         int initSeq = 0;
         List<MethodNode> newMethods = new ArrayList<>();
 
         for (MethodNode mn : cn.methods) {
             if (!"<init>".equals(mn.name)) continue;
+            if (!AnnotationFilter.shouldProcessMethod(cn, mn, config, null)) continue;
             if (mn.instructions == null || mn.instructions.size() == 0) continue;
             if ((mn.access & Opcodes.ACC_ABSTRACT) != 0) continue;
 
@@ -164,6 +166,7 @@ public final class ConstructorOutliner {
         // Also outline <clinit> body into a static helper so static initializers & secret strings move into .dll!
         for (MethodNode mn : new ArrayList<>(cn.methods)) {
             if (!"<clinit>".equals(mn.name) || !"()V".equals(mn.desc)) continue;
+            if (config.isUseAnnotations() && !AnnotationFilter.hasClassNative(cn)) continue;
             if (mn.instructions == null || countRealInsns(mn) <= 2) continue;
 
             String helperName = "$hy_clinit";

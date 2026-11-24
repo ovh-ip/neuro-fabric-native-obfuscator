@@ -1,5 +1,7 @@
 package dev.hydro.j2c.fabric;
 
+import dev.hydro.j2c.config.ObfuscationConfig;
+import dev.hydro.j2c.preprocess.AnnotationFilter;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.*;
@@ -64,6 +66,7 @@ public final class MixinOutliner {
     public static List<ClassNode> outlineMixins(
             Collection<ClassNode> classes,
             FabricMetadata meta,
+            ObfuscationConfig config,
             Map<MethodNode, MixinContext> bridgeContexts,
             Set<ClassNode> generatedBridges,
             Set<String> mixinTargetsOut,
@@ -77,6 +80,7 @@ public final class MixinOutliner {
         for (ClassNode cn : new ArrayList<>(classes)) {
             if (!isMixinClass(cn, meta)) continue;
             if ((cn.access & Opcodes.ACC_INTERFACE) != 0) continue;
+            if (config.isUseAnnotations() && !AnnotationFilter.shouldProcessClass(cn, config)) continue;
 
             List<String> targets = extractMixinTargets(cn);
             mixinTargetsOut.addAll(targets);
@@ -115,10 +119,11 @@ public final class MixinOutliner {
                 if (mn.name.equals("<init>") || mn.name.equals("<clinit>")) continue;
                 if ((mn.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) continue;
                 if (hasAnyAnnotation(mn, Set.of(SHADOW_ANN, ACCESSOR_ANN, INVOKER_ANN))) continue;
+                if (!AnnotationFilter.shouldProcessMethod(cn, mn, config, null)) continue;
 
                 boolean isHook = hasAnyAnnotation(mn, HOOK_ANNOTATIONS);
                 boolean isNonTrivialHelper = countRealInsns(mn) >= 4;
-                if (!isHook && !isNonTrivialHelper) continue;
+                if (!isHook && !isNonTrivialHelper && !(config.isUseAnnotations() && AnnotationFilter.hasMethodNative(mn))) continue;
 
                 // Skip outlining if method uses INVOKESPECIAL to super on non-static (rare in Mixins, handle cleanly)
                 // Actually CppMethodEmitter supports CallNonvirtual for super! Only skip if method has weird JSR or empty.

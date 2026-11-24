@@ -24,11 +24,18 @@ public final class TestHarness {
 
     public static void main(String[] args) throws Exception {
         Path protectedJar = Path.of(args[0]);
+        boolean annotOnlyMode = args.length > 1 && "--annot-only".equals(args[1]);
         URL jarUrl = protectedJar.toUri().toURL();
 
         // Isolated child classloader whose parent is platform classloader (no test-classes on parent!)
         try (MixinSimClassLoader loader = new MixinSimClassLoader(new URL[]{jarUrl}, ClassLoader.getPlatformClassLoader(), protectedJar)) {
             Class<?> entryCls = Class.forName("dev.hydro.testmod.TestModEntrypoint", true, loader);
+            if (annotOnlyMode) {
+                Method runAnn = entryCls.getDeclaredMethod("runAnnotationOnlyTests", boolean.class);
+                String res = (String) runAnn.invoke(null, true);
+                System.out.println("[TestHarness] AnnotationOnlyTests => " + res);
+                return;
+            }
             Method runAll = entryCls.getDeclaredMethod("runAllSelfTests");
             String result = (String) runAll.invoke(null);
             System.out.println("[TestHarness] SelfTests => " + result);

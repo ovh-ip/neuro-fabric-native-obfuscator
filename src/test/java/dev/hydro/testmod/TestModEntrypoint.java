@@ -1,6 +1,7 @@
 package dev.hydro.testmod;
 
 import dev.hydro.testmod.mixin.ClientMixin;
+import dev.neuro.nativeobfuscator.Native;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -8,6 +9,7 @@ import java.util.List;
 
 public class TestModEntrypoint {
 
+    @Native
     public static String runAllSelfTests() throws Exception {
         // 1. Verify methods really became ACC_NATIVE
         Method edge = SecretLogic.class.getDeclaredMethod("integerAndFloatEdgeCases", int.class, long.class, float.class, double.class);
@@ -63,7 +65,6 @@ public class TestModEntrypoint {
 
         // 6. Lambdas, Records, StringConcat, Unicode + NUL char
         String lamRes = SecretLogic.lambdasAndStrings(List.of(1, 2, 3, 4, 5), 10);
-        // odds: 1, 3, 5 -> (10+3)+(30+3)+(50+3) = 99
         if (!"sum=99|len=25.0|u=10:\u041f".equals(lamRes)) {
             throw new AssertionError("Lambda/String test failed: " + lamRes);
         }
@@ -81,15 +82,59 @@ public class TestModEntrypoint {
             throw new AssertionError("Stress mismatch: " + stress);
         }
 
-        // 9. Benchmark 1,000,000 tight native loop ops
+        // 9. Annotated methods check
+        String annRes = runAnnotationOnlyTests(false);
+
+        // 10. Benchmark 1,000,000 tight native loop ops
         long t0 = System.nanoTime();
         int bench = SecretLogic.computeBenchmark(1_000_000);
         long ms = (System.nanoTime() - t0) / 1_000_000L;
 
-        // 10. Simulate Mixin merged target behavior!
-        // Note: ClientMixin.onClientTick is a trampoline calling the native bridge with `this`.
-        // When Mixin merges ClientMixin into FakeMinecraftClient at runtime, `this` IS FakeMinecraftClient!
-        // Verify FakeMinecraftClient fields/methods remain intact and Mixin trampoline calls native bridge cleanly.
-        return "ALL_PASS bench=" + bench + " (" + ms + "ms)";
+        return "ALL_PASS " + annRes + " bench=" + bench + " (" + ms + "ms)";
+    }
+
+    @Native
+    public static String runAnnotationOnlyTests(boolean strictAnnotationMode) throws Exception {
+        Method mNat = AnnotatedSample.class.getDeclaredMethod("nativeOnlyAdd", int.class, int.class);
+        Method mVm = AnnotatedSample.class.getDeclaredMethod("vmOnlyTransform", String.class, int.class);
+        Method mLam = AnnotatedSample.class.getDeclaredMethod("nativeWithLambda", List.class);
+        Method mPlain = AnnotatedSample.class.getDeclaredMethod("plainJavaAdd", int.class, int.class);
+
+        if (!Modifier.isNative(mNat.getModifiers())) throw new AssertionError("nativeOnlyAdd must be native!");
+        if (!Modifier.isNative(mVm.getModifiers())) throw new AssertionError("vmOnlyTransform must be native!");
+        if (!Modifier.isNative(mLam.getModifiers())) throw new AssertionError("nativeWithLambda must be native!");
+
+        Method mInc = AnnotatedClassWithExclusion.class.getDeclaredMethod("getIncludedSecret");
+        Method mExc = AnnotatedClassWithExclusion.class.getDeclaredMethod("fastNotNative", int.class);
+        if (!Modifier.isNative(mInc.getModifiers())) throw new AssertionError("getIncludedSecret must be native!");
+        if (Modifier.isNative(mExc.getModifiers())) throw new AssertionError("@NotNative fastNotNative MUST NOT be native!");
+
+        if (strictAnnotationMode) {
+            if (Modifier.isNative(mPlain.getModifiers())) {
+                throw new AssertionError("plainJavaAdd MUST NOT be native in -a mode!");
+            }
+            Method unann = SecretLogic.class.getDeclaredMethod("computeBenchmark", int.class);
+            if (Modifier.isNative(unann.getModifiers())) {
+                throw new AssertionError("Unannotated SecretLogic.computeBenchmark MUST NOT be native in -a mode!");
+            }
+        }
+
+        if (AnnotatedSample.nativeOnlyAdd(10, 5) != ((10 ^ 0x5A5A) + 35)) {
+            throw new AssertionError("nativeOnlyAdd value mismatch");
+        }
+        if (!"VM[hi:21]".equals(AnnotatedSample.vmOnlyTransform("hi", 7))) {
+            throw new AssertionError("vmOnlyTransform value mismatch");
+        }
+        if (AnnotatedSample.nativeWithLambda(List.of(1, 2, 3)) != (4 + 7 + 10)) {
+            throw new AssertionError("nativeWithLambda mismatch");
+        }
+        if (AnnotatedSample.plainJavaAdd(11, 22) != 33) {
+            throw new AssertionError("plainJavaAdd mismatch");
+        }
+        AnnotatedClassWithExclusion ac = new AnnotatedClassWithExclusion(5);
+        if (ac.getIncludedSecret() != (((5 * 13) ^ 0xCAFE) + 42) || ac.fastNotNative(9) != 19) {
+            throw new AssertionError("AnnotatedClassWithExclusion mismatch");
+        }
+        return "ANN_OK";
     }
 }

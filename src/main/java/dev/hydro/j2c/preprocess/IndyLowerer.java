@@ -17,7 +17,7 @@ import java.util.Set;
  */
 public final class IndyLowerer {
 
-    public static void lowerClass(ClassNode cn, Set<MethodNode> nonNativeHelpers) {
+    public static void lowerClass(ClassNode cn, Set<MethodNode> nonNativeHelpers, Set<MethodNode> eligibleFilter) {
         boolean isInterface = (cn.access & Opcodes.ACC_INTERFACE) != 0;
         int helperAccess = (isInterface && (cn.version & 0xFFFF) < Opcodes.V9)
                 ? (Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC)
@@ -30,6 +30,7 @@ public final class IndyLowerer {
         for (int mIdx = 0; mIdx < cn.methods.size(); mIdx++) {
             MethodNode mn = cn.methods.get(mIdx);
             if (mn.instructions == null || mn.instructions.size() == 0) continue;
+            if (eligibleFilter != null && !eligibleFilter.contains(mn)) continue;
 
             // Inline legacy JSR/RET if present
             if (hasJsr(mn)) {
@@ -44,6 +45,7 @@ public final class IndyLowerer {
                         mn.exceptions != null ? mn.exceptions.toArray(new String[0]) : null);
                 mn.accept(adapter);
                 cn.methods.set(mIdx, inlined);
+                if (eligibleFilter != null) eligibleFilter.add(inlined);
                 mn = inlined;
             }
 

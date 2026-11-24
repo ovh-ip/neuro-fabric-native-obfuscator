@@ -24,6 +24,7 @@ public final class ObfuscationConfig {
     private String stripPath;
 
     private ProtectionTier tier = ProtectionTier.STRONG;
+    private boolean useAnnotations = false;
     private boolean embedDll = true;
     private boolean encryptEmbeddedDll = false;
     private boolean fuckedClasses = true;
@@ -67,6 +68,9 @@ public final class ObfuscationConfig {
 
     public ProtectionTier getTier() { return tier; }
     public void setTier(ProtectionTier tier) { this.tier = tier; }
+
+    public boolean isUseAnnotations() { return useAnnotations; }
+    public void setUseAnnotations(boolean useAnnotations) { this.useAnnotations = useAnnotations; }
 
     public boolean isEmbedDll() { return embedDll; }
     public void setEmbedDll(boolean embedDll) { this.embedDll = embedDll; }

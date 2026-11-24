@@ -10,6 +10,7 @@ import dev.hydro.j2c.crypto.CryptoEngine;
 import dev.hydro.j2c.crypto.SymbolPool;
 import dev.hydro.j2c.fabric.FabricMetadata;
 import dev.hydro.j2c.fabric.MixinOutliner;
+import dev.hydro.j2c.preprocess.AnnotationFilter;
 import dev.hydro.j2c.preprocess.ConstructorOutliner;
 import dev.hydro.j2c.preprocess.IndyLowerer;
 import dev.hydro.j2c.preprocess.JavaPreHardener;
@@ -96,12 +97,28 @@ public final class JarProcessor implements Opcodes {
         Set<String> mixinTargets = new HashSet<>();
         if (config.isProcessMixins()) {
             List<ClassNode> extraBridges = MixinOutliner.outlineMixins(
-                    classes.values(), fabricMeta, mixinBridgeContexts, generatedMixinBridges,
+                    classes.values(), fabricMeta, config, mixinBridgeContexts, generatedMixinBridges,
                     mixinTargets, loaderInternal, bootMethodName, rng);
             for (ClassNode b : extraBridges) classes.put(b.name, b);
         }
 
-        // 2. Select target classes and run IndyLowerer + ConstructorOutliner + JavaPreHardener
+        // 2. Select target classes and collect lambda/annotation targets
+        if (!config.isUseAnnotations()) {
+            boolean foundNativeAnn = false;
+            for (ClassNode cn : classes.values()) {
+                if (AnnotationFilter.hasClassNative(cn)) { foundNativeAnn = true; break; }
+                if (cn.methods != null) {
+                    for (MethodNode mn : cn.methods) {
+                        if (AnnotationFilter.hasMethodNative(mn)) { foundNativeAnn = true; break; }
+                    }
+                }
+                if (foundNativeAnn) break;
+            }
+            if (foundNativeAnn) {
+                System.out.println("[HydroJ2C] Note: @Native annotations detected; pass -a / --annotations to compile ONLY annotated classes/methods.");
+            }
+        }
+
         Set<ClassNode> targetClasses = new LinkedHashSet<>();
         for (ClassNode cn : classes.values()) {
             if (generatedMixinBridges.contains(cn) || shouldIncludeClass(cn, fabricMeta, config)) {
@@ -111,15 +128,28 @@ public final class JarProcessor implements Opcodes {
 
         Set<MethodNode> nonNativeHelpers = Collections.newSetFromMap(new IdentityHashMap<>());
         Set<MethodNode> outlinedCtorBodies = Collections.newSetFromMap(new IdentityHashMap<>());
+        Map<ClassNode, Set<MethodNode>> classEligibleMethods = new IdentityHashMap<>();
 
         for (ClassNode cn : targetClasses) {
             if (config.isStripDebugInfo()) {
                 JavaPreHardener.stripDebugInfo(cn);
             }
-            IndyLowerer.lowerClass(cn, nonNativeHelpers);
-            if (config.isOutlineConstructors() && !MixinOutliner.isMixinClass(cn, fabricMeta)) {
-                ConstructorOutliner.outlineConstructors(cn, outlinedCtorBodies);
+            Set<MethodNode> lambdas = AnnotationFilter.collectLambdaTargets(cn, config);
+            Set<MethodNode> eligibleSet = Collections.newSetFromMap(new IdentityHashMap<>());
+            if (cn.methods != null) {
+                for (MethodNode mn : cn.methods) {
+                    if (generatedMixinBridges.contains(cn)
+                            || AnnotationFilter.shouldProcessMethod(cn, mn, config, lambdas)) {
+                        eligibleSet.add(mn);
+                    }
+                }
             }
+            IndyLowerer.lowerClass(cn, nonNativeHelpers, eligibleSet);
+            if (config.isOutlineConstructors() && !MixinOutliner.isMixinClass(cn, fabricMeta)) {
+                ConstructorOutliner.outlineConstructors(cn, config, outlinedCtorBodies);
+                eligibleSet.addAll(outlinedCtorBodies);
+            }
+            classEligibleMethods.put(cn, eligibleSet);
         }
 
         // 3. Compile methods into Flattened C++ or Encrypted Native VM
@@ -146,9 +176,11 @@ public final class JarProcessor implements Opcodes {
             boolean isMixin = MixinOutliner.isMixinClass(cn, fabricMeta);
             if (isMixin && config.isProcessMixins()) continue;
 
+            Set<MethodNode> eligibleSet = classEligibleMethods.getOrDefault(cn, Set.of());
             List<CppRuntimeEmitter.RegisteredMethod> regMethodsForClass = new ArrayList<>();
             for (MethodNode mn : new ArrayList<>(cn.methods)) {
                 if (!isEligibleMethod(cn, mn, nonNativeHelpers)) continue;
+                if (!eligibleSet.contains(mn) && !outlinedCtorBodies.contains(mn)) continue;
 
                 Frame<FrameAnalyzer.TypedValue>[] frames;
                 try {
@@ -193,6 +225,14 @@ public final class JarProcessor implements Opcodes {
                 regClasses.add(new CppRuntimeEmitter.RegisteredClass(cid, cn.name, regMethodsForClass));
                 ClassRewriter.injectClassRegistration(cn, cid, loaderInternal, regMethodName);
             }
+        }
+
+        // Clean @Native / @NotNative / @NativeVM annotations from output classes and drop bundled annotation classes
+        classes.keySet().removeIf(name ->
+                name.startsWith("dev/neuro/nativeobfuscator/")
+                        || name.startsWith("by/radioegor146/nativeobfuscator/"));
+        for (ClassNode cn : classes.values()) {
+            AnnotationFilter.cleanAnnotations(cn);
         }
 
         // 4. Populate junk classes, nested junk directories, and decoy .fucked blobs
@@ -355,14 +395,11 @@ public final class JarProcessor implements Opcodes {
 
     private static boolean shouldIncludeClass(ClassNode cn, FabricMetadata meta, ObfuscationConfig config) {
         if ((cn.access & ACC_ANNOTATION) != 0) return false;
-        for (String exc : config.getExcludePatterns()) {
-            if (ObfuscationConfig.matchesGlob(cn.name, exc)) return false;
+        if (cn.name.startsWith("dev/neuro/nativeobfuscator/")
+                || cn.name.startsWith("by/radioegor146/nativeobfuscator/")) {
+            return false;
         }
-        if (config.getIncludePatterns().isEmpty()) return true;
-        for (String inc : config.getIncludePatterns()) {
-            if (ObfuscationConfig.matchesGlob(cn.name, inc)) return true;
-        }
-        return false;
+        return AnnotationFilter.shouldProcessClass(cn, config);
     }
 
     private static boolean isEligibleMethod(ClassNode cn, MethodNode mn, Set<MethodNode> nonNativeHelpers) {
@@ -375,6 +412,7 @@ public final class JarProcessor implements Opcodes {
 
     private static boolean shouldUseVm(ClassNode cn, MethodNode mn, MixinOutliner.MixinContext mCtx, ObfuscationConfig config) {
         if (mCtx != null) return false;
+        if (AnnotationFilter.shouldUseVm(cn, mn)) return true;
         String full = cn.name + "." + mn.name;
         for (String exc : config.getVmExcludePatterns()) {
             if (ObfuscationConfig.matchesGlob(cn.name, exc) || ObfuscationConfig.matchesGlob(full, exc)) return false;

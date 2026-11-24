@@ -3,7 +3,9 @@ package dev.hydro.j2c;
 import dev.hydro.j2c.config.ObfuscationConfig;
 import dev.hydro.j2c.jar.JarProcessor;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 /**
  * CLI entrypoint for HydroJ2C — Native Java-to-C++ (.dll) + Encrypted VM Protector for Minecraft Fabric Mods.
@@ -24,6 +26,9 @@ public final class Main {
                 case "-o", "--output" -> cfg.setOutputJar(Path.of(nextArg(args, ++i, a)));
                 case "-d", "--dll" -> cfg.setOutputDll(Path.of(nextArg(args, ++i, a)));
                 case "--tier" -> cfg.setTier(ObfuscationConfig.ProtectionTier.valueOf(nextArg(args, ++i, a).toUpperCase()));
+                case "-a", "--annotations" -> cfg.setUseAnnotations(true);
+                case "-w", "--white-list" -> loadListFile(Path.of(nextArg(args, ++i, a)), cfg.getIncludePatterns());
+                case "-b", "--black-list" -> loadListFile(Path.of(nextArg(args, ++i, a)), cfg.getExcludePatterns());
                 case "--include" -> cfg.getIncludePatterns().add(nextArg(args, ++i, a));
                 case "--exclude" -> cfg.getExcludePatterns().add(nextArg(args, ++i, a));
                 case "--vm" -> cfg.getVmIncludePatterns().add(nextArg(args, ++i, a));
@@ -73,6 +78,7 @@ public final class Main {
 
         System.out.println("[HydroJ2C] Protecting: " + cfg.getInputJar());
         System.out.println("[HydroJ2C] Tier: " + cfg.getTier()
+                + " | Annotations=" + cfg.isUseAnnotations()
                 + " | AntiDebug=" + cfg.isAntiDebug()
                 + " | AntiDump=" + cfg.isAntiDump()
                 + " | AntiTamper=" + cfg.isAntiTamper()
@@ -91,6 +97,15 @@ public final class Main {
         System.out.println("  Output DLL:          " + res.outputDll);
     }
 
+    private static void loadListFile(Path file, List<String> target) throws Exception {
+        for (String raw : Files.readAllLines(file)) {
+            String line = raw.trim();
+            if (!line.isEmpty() && !line.startsWith("#")) {
+                target.add(line);
+            }
+        }
+    }
+
     private static String nextArg(String[] args, int idx, String flag) {
         if (idx >= args.length) throw new IllegalArgumentException("Missing value for " + flag);
         return args[idx];
@@ -103,6 +118,9 @@ public final class Main {
                   hydro -i <input-mod.jar> [-o <output-mod.jar>] [-d <output.dll>] [options]
 
                 Options:
+                  -a, --annotations            Process only @Native classes/methods (and respect @NotNative / @NativeVM)
+                  -w, --white-list <file>      Read whitelist class/method patterns from file
+                  -b, --black-list <file>      Read blacklist class/method patterns from file
                   --tier <FAST|STRONG|ULTRA>   Protection level (default: STRONG; ULTRA adds Native VM)
                   --include <glob>             Class/package glob (auto-detected from fabric.mod.json if omitted)
                   --exclude <glob>             Exclude class/package glob

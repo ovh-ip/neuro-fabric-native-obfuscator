@@ -6,6 +6,8 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BuildOut = Join-Path $Root "build\classes"
+$AnnOut   = Join-Path $Root "build\ann-classes"
+$AnnJar   = Join-Path $Root "build\neuro-annotations.jar"
 $DistJar  = Join-Path $Root "build\hydro-j2c.jar"
 $Libs = Join-Path $Root "libs\*"
 
@@ -25,7 +27,16 @@ $Javap = Join-Path $Jdk "bin\javap.exe"
 
 function Build-Hydro {
     if (Test-Path $BuildOut) { Remove-Item -Recurse -Force $BuildOut }
+    if (Test-Path $AnnOut) { Remove-Item -Recurse -Force $AnnOut }
     New-Item -ItemType Directory -Force $BuildOut | Out-Null
+    New-Item -ItemType Directory -Force $AnnOut | Out-Null
+
+    $annSources = Get-ChildItem -Recurse (Join-Path $Root "annotations\src\main\java") -Filter "*.java" | ForEach-Object { $_.FullName }
+    & $Javac -encoding UTF-8 --release 17 -d $AnnOut $annSources
+    if ($LASTEXITCODE -ne 0) { throw "annotations javac failed" }
+    & $Jar cf $AnnJar -C $AnnOut .
+    if ($LASTEXITCODE -ne 0) { throw "annotations jar failed" }
+
     $sources = Get-ChildItem -Recurse (Join-Path $Root "src\main\java") -Filter "*.java" | ForEach-Object { $_.FullName }
     & $Javac -encoding UTF-8 --release 21 -cp $Libs -d $BuildOut $sources
     if ($LASTEXITCODE -ne 0) { throw "javac failed" }
@@ -49,7 +60,7 @@ function Build-Hydro {
     & $Jar cfe $DistJar dev.hydro.j2c.Main -C $stage .
     if ($LASTEXITCODE -ne 0) { throw "fat jar failed" }
     Remove-Item -Recurse -Force $stage
-    Write-Host "[HydroJ2C] Built successfully -> $DistJar"
+    Write-Host "[HydroJ2C] Built successfully -> $DistJar & $AnnJar"
 }
 
 switch ($Action.ToLower()) {
@@ -78,7 +89,7 @@ switch ($Action.ToLower()) {
         New-Item -ItemType Directory -Force $HarnessBuild | Out-Null
 
         $testSources = Get-ChildItem -Recurse (Join-Path $Root "src\test\java") -Filter "*.java" | ForEach-Object { $_.FullName }
-        & $Javac -encoding UTF-8 --release 21 -d $TestBuild $testSources
+        & $Javac -encoding UTF-8 --release 21 -cp $AnnJar -d $TestBuild $testSources
         if ($LASTEXITCODE -ne 0) { throw "test javac failed" }
 
         $harnessSources = Get-ChildItem -Recurse (Join-Path $Root "src\test\harness") -Filter "*.java" | ForEach-Object { $_.FullName }
@@ -138,6 +149,16 @@ switch ($Action.ToLower()) {
         Write-Host "`n=== Executing ULTRA external-dll protected mod JAR ==="
         & $Java -cp "$HarnessBuild;$Libs" dev.hydro.harness.TestHarness $ProtExtJar
         if ($LASTEXITCODE -ne 0) { throw "ULTRA external-dll verification failed" }
+
+        Write-Host "`n=== Running Annotation-Only (-a / @Native / @NotNative / @NativeVM) protection ==="
+        $ProtAnnJar = Join-Path $Root "build\test-mod-annot.jar"
+        $ProtAnnDll = Join-Path $Root "build\test-mod-annot.dll"
+        & $Java -cp $cp dev.hydro.j2c.Main -a -i $TestJar -o $ProtAnnJar -d $ProtAnnDll --tier STRONG
+        if ($LASTEXITCODE -ne 0) { throw "Annotation-only protection failed" }
+
+        Write-Host "`n=== Executing Annotation-Only protected mod JAR ==="
+        & $Java -cp "$HarnessBuild;$Libs" dev.hydro.harness.TestHarness $ProtAnnJar --annot-only
+        if ($LASTEXITCODE -ne 0) { throw "Annotation-only verification failed" }
 
         Write-Host "`n=== Running Anti-Tamper negative test (modifying fabric.mod.json in copy) ==="
         $TamperedJar = Join-Path $Root "build\test-mod-tampered.jar"

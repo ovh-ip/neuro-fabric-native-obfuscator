@@ -54,13 +54,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File hydro.ps1 test
 ```
 Скрипт скомпилирует протектор в `build\hydro-j2c.jar`, соберёт тестовый Fabric-мод, прогонит защиту в режимах `STRONG` и `ULTRA`, проверит таблицу экспортов `.dll`, структуру `natives/` и `.fucked` и выполнит проверку в изолированном `ClassLoader` с симуляцией Mixin и тестом Anti-Tamper.
 
-### 2. Сборка fat JAR
+### 2. Сборка fat JAR и библиотеки аннотаций
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File hydro.ps1 build
 ```
+После сборки появятся:
+- `build\hydro-j2c.jar` — сам протектор;
+- `build\neuro-annotations.jar` — аннотации `@Native`, `@NotNative`, `@NativeVM` для подключения в мод (`compileOnly`).
 
 ### 3. Защита Fabric-мода
-**Режим `STRONG`** (максимальная производительность CFF + MBA + Opaque Predicates, `.fucked`-классы, `natives/*.dll` внутри JAR):
+
+**Режим аннотаций (`-a` / `--annotations`, как в `native-obfuscator`)** — в `.dll` уйдут только классы и методы с `@Native` / `@NativeVM` (включая их лямбды и `@Mixin`-хуки), остальной код останется нетронутым Java-байткодом:
+```java
+import dev.neuro.nativeobfuscator.Native;
+import dev.neuro.nativeobfuscator.NotNative;
+import dev.neuro.nativeobfuscator.NativeVM;
+
+@Native
+public class AuthManager {
+    public boolean checkLicense(String key) { ... } // уйдёт в .dll как CFF+MBA native
+
+    @NativeVM
+    public byte[] decryptPayload(byte[] data) { ... } // уйдёт в полиморфную Native VM
+
+    @NotNative
+    public String getVersion() { return "1.0"; } // останется в Java
+}
+```
+> Поддерживаются также аннотации `by.radioegor146.nativeobfuscator.Native` и `NotNative` — в итоговом JAR все маркеры аннотаций автоматически вычищаются.
+
+Запуск с `-a`:
+```powershell
+java -jar build\hydro-j2c.jar -a -i my-mod.jar -o my-mod-protected.jar --tier STRONG
+```
+
+**Полная защита всего мода (`STRONG`)** (без `-a`, максимальная производительность CFF + MBA + Opaque Predicates, `.fucked`-классы, `natives/*.dll` внутри JAR):
 ```powershell
 java -jar build\hydro-j2c.jar -i my-mod.jar -o my-mod-protected.jar --tier STRONG
 ```
@@ -79,6 +107,9 @@ java -jar build\hydro-j2c.jar -i my-mod.jar -o my-mod-protected.jar --tier ULTRA
 | `-i, --input <jar>` | Входной `.jar` файл мода | Обязательно |
 | `-o, --output <jar>` | Выходной защищённый `.jar` | `<name>-protected.jar` |
 | `-d, --dll <dll>` | Путь для сохранения `.dll` на диск | Рядом с выходным JAR |
+| `-a, --annotations` | Переносить в `.dll` только `@Native` / `@NativeVM` (учитывать `@NotNative`) | Выкл (защищаются все классы мода) |
+| `-w, --white-list <file>` | Whitelist файл со списком классов/масок | — |
+| `-b, --black-list <file>` | Blacklist файл со списком исключений | — |
 | `--tier <FAST\|STRONG\|ULTRA>` | Уровень защиты (`ULTRA` включает Native VM) | `STRONG` |
 | `--include <glob>` | Маска включаемых классов/пакетов | Авто из `fabric.mod.json` |
 | `--exclude <glob>` | Маска исключаемых классов/пакетов | — |
