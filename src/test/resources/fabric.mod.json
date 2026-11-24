@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "hydrotest",
+  "version": "1.0.0",
+  "name": "Hydro Test Fabric Mod",
+  "entrypoints": {
+    "main": [
+      "dev.hydro.testmod.TestModEntrypoint"
+    ]
+  },
+  "mixins": [
+    "hydrotest.mixins.json"
+  ]
+}

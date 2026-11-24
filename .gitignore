@@ -1,0 +1,11 @@
+build/
+.gradle/
+.idea/
+out/
+*.iml
+*.log
+*.dll
+*.o
+*.obj
+*.exe
+!libs/*.jar
