@@ -37,6 +37,7 @@
 #define HY_MBA_VM_MIX_MUL(op) 1ULL
 #define HY_MBA_VM_DISP_MUL(op) 1u
 #define HY_MBA_VM_DISP_XOR(op) 0u
+#define HY_MBA_SESS_ALIVE_MAGIC(op) 0x6A09E667F3BCC909ULL
 
 #define HY_HASH_KERNEL32 0u
 #define HY_HASH_NTDLL 0u
@@ -72,6 +73,15 @@
 #define HY_HASH_X64DBG 0u
 #define HY_HASH_SCYLLA 0u
 #define HY_HASH_VEHDBG 0u
+#define HY_HASH_FRIDA_CORE 0u
+#define HY_HASH_VEHDBG32 0u
+#define HY_HASH_CE64 0u
+#define HY_HASH_TITAN 0u
+#define HY_HASH_SHARPOD 0u
+#define HY_HASH_MINHOOK64 0u
+#define HY_HASH_CREATEFILEA 0u
+#define HY_HASH_READFILE 0u
+#define HY_HASH_CLOSEHANDLE 0u
 
 #define HY_SYM_CLASS 0u
 #define HY_SYM_FORNAME 0u
@@ -180,6 +190,13 @@
 #define HY_SYM_J_NONCE 0u
 #define HY_SYM_J_CT 0u
 #define HY_SYM_J_MAC 0u
+#define HY_SYM_EP_LO 0u
+#define HY_SYM_REQ_E2 0u
+#define HY_SYM_REQ_M2 0u
+#define HY_SYM_HBQ_PFX 0u
+#define HY_SYM_HB_PFX 0u
+#define HY_SYM_LOQ_PFX 0u
+#define HY_SYM_LO_PFX 0u
 
 #define HY_OP_NOP 0
 #define HY_OP_CONST_I32 1
@@ -384,6 +401,10 @@ extern const uint32_t g_verify_res_syms[];
 extern const uint32_t g_verify_res_count;
 extern const uint8_t g_srv_pubkey_masked[32];
 extern volatile uint64_t g_srv_dyn_params[8];
+extern volatile uint64_t g_sess_state_masked;
+extern volatile uint64_t g_sess_deadline_masked;
+extern volatile uint64_t g_hb_pulse_masked;
+extern volatile uint64_t g_hb_silence_limit_ms;
 
 extern const uint8_t g_vm_code[];
 extern const int32_t g_vm_call_ak[];
@@ -766,8 +787,31 @@ uintptr_t load_sys_module(uint32_t mod_hash, uint32_t mod_sym);
 bool has_inline_hook(const void* fn);
 void run_security_checks(JNIEnv* env);
 void run_periodic_vm_guard();
+void destroy_session_keys();
+bool verify_session_window();
 bool check_session_alive();
+void server_logout();
 bool server_handshake(JNIEnv* env, uint64_t jar_digest, uint64_t* out_vm_share, uint64_t* out_vault_share);
 uint64_t vm_exec_core(JNIEnv* env, uint32_t vm_method_id, const uint64_t* init_vals, const uint8_t* init_is_ref, int32_t init_slots, jobject* out_ref);
+
+HY_FORCEINLINE bool inline_session_ok(uint64_t op_seed) {
+    if (g_tampered) [[unlikely]] { destroy_session_keys(); return false; }
+#if !HY_ENABLE_SERVER
+    (void)op_seed;
+    return true;
+#else
+    uint64_t st = __atomic_load_n(&g_sess_state_masked, __ATOMIC_ACQUIRE);
+    uint64_t expected = HY_MBA_SESS_ALIVE_MAGIC(op_seed) ^ (uint64_t)g_ptr_cookie;
+    if (st != expected) [[unlikely]] {
+        destroy_session_keys();
+        return false;
+    }
+    if (!verify_session_window()) [[unlikely]] {
+        destroy_session_keys();
+        return false;
+    }
+    return true;
+#endif
+}
 
 } // namespace hy

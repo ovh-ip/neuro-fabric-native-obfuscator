@@ -18,15 +18,18 @@ import java.util.Set;
 public final class IndyLowerer {
 
     public static void lowerClass(ClassNode cn, Set<MethodNode> nonNativeHelpers, Set<MethodNode> eligibleFilter) {
+        lowerClass(cn, nonNativeHelpers, eligibleFilter, new java.util.Random(cn.name.hashCode()));
+    }
+
+    public static void lowerClass(ClassNode cn, Set<MethodNode> nonNativeHelpers, Set<MethodNode> eligibleFilter, java.util.Random rng) {
         boolean isInterface = (cn.access & Opcodes.ACC_INTERFACE) != 0;
         int helperAccess = (isInterface && (cn.version & 0xFFFF) < Opcodes.V9)
                 ? (Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC)
                 : (Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC);
 
         List<MethodNode> generatedHelpers = new ArrayList<>();
-        int indySeq = 0;
-        int condySeq = 0;
-        int polySeq = 0;
+        java.util.Set<String> usedNames = new java.util.HashSet<>();
+        for (MethodNode m : cn.methods) usedNames.add(m.name);
 
         for (int mIdx = 0; mIdx < cn.methods.size(); mIdx++) {
             MethodNode mn = cn.methods.get(mIdx);
@@ -56,7 +59,10 @@ public final class IndyLowerer {
                 AbstractInsnNode next = insn.getNext();
                 if (insn instanceof InvokeDynamicInsnNode indy) {
                     if (!isStringConcat(indy)) {
-                        String helperName = "$hy_i_" + (indySeq++);
+                        String helperName;
+                        do {
+                            helperName = "i_" + Long.toUnsignedString(rng.nextLong() & 0xFFFFFFFFL, 36);
+                        } while (!usedNames.add(helperName));
                         MethodNode helper = new MethodNode(helperAccess, helperName, indy.desc, null, null);
                         Type mt = Type.getMethodType(indy.desc);
                         int slot = 0;
@@ -75,7 +81,10 @@ public final class IndyLowerer {
                                 Opcodes.INVOKESTATIC, cn.name, helperName, indy.desc, isInterface));
                     }
                 } else if (insn instanceof LdcInsnNode ldc && ldc.cst instanceof ConstantDynamic cd) {
-                    String helperName = "$hy_c_" + (condySeq++);
+                    String helperName;
+                    do {
+                        helperName = "k_" + Long.toUnsignedString(rng.nextLong() & 0xFFFFFFFFL, 36);
+                    } while (!usedNames.add(helperName));
                     Type retType = Type.getType(cd.getDescriptor());
                     String helperDesc = "()" + cd.getDescriptor();
                     MethodNode helper = new MethodNode(helperAccess, helperName, helperDesc, null, null);
@@ -89,7 +98,10 @@ public final class IndyLowerer {
                     mn.instructions.set(insn, new MethodInsnNode(
                             Opcodes.INVOKESTATIC, cn.name, helperName, helperDesc, isInterface));
                 } else if (insn instanceof MethodInsnNode mi && isPolymorphicSignatureCall(mi)) {
-                    String helperName = "$hy_mh_" + (polySeq++);
+                    String helperName;
+                    do {
+                        helperName = "h_" + Long.toUnsignedString(rng.nextLong() & 0xFFFFFFFFL, 36);
+                    } while (!usedNames.add(helperName));
                     Type mt = Type.getMethodType(mi.desc);
                     Type[] origArgs = mt.getArgumentTypes();
                     Type[] fullArgs = new Type[origArgs.length + 1];

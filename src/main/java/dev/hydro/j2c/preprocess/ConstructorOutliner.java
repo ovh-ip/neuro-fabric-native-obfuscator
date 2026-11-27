@@ -16,9 +16,14 @@ import java.util.*;
 public final class ConstructorOutliner {
 
     public static void outlineConstructors(ClassNode cn, ObfuscationConfig config, Set<MethodNode> outlinedTargets) {
+        outlineConstructors(cn, config, outlinedTargets, new Random(cn.name.hashCode()));
+    }
+
+    public static void outlineConstructors(ClassNode cn, ObfuscationConfig config, Set<MethodNode> outlinedTargets, Random rng) {
         if ((cn.access & Opcodes.ACC_INTERFACE) != 0) return;
-        int initSeq = 0;
         List<MethodNode> newMethods = new ArrayList<>();
+        Set<String> usedNames = new HashSet<>();
+        for (MethodNode m : cn.methods) usedNames.add(m.name);
 
         for (MethodNode mn : cn.methods) {
             if (!"<init>".equals(mn.name)) continue;
@@ -34,7 +39,7 @@ public final class ConstructorOutliner {
             if (superIdx < 0) continue;
 
             int tailCount = countRealInsnsAfter(mn, superCall);
-            if (tailCount <= 3) continue; // Only `return` or trivial single assignment
+            if (tailCount <= 1) continue; // Only bare `return`
 
             if (!canSplitSafely(mn, superIdx)) continue;
 
@@ -68,7 +73,10 @@ public final class ConstructorOutliner {
                 slot += t.getSize();
             }
 
-            String helperName = "$hy_init_" + (initSeq++);
+            String helperName;
+            do {
+                helperName = "c_" + Long.toUnsignedString(rng.nextLong() & 0xFFFFFFFFL, 36);
+            } while (!usedNames.add(helperName));
             String helperDesc = Type.getMethodDescriptor(Type.VOID_TYPE, paramTypes.toArray(new Type[0]));
             MethodNode helper = new MethodNode(
                     Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC,
@@ -167,11 +175,12 @@ public final class ConstructorOutliner {
         for (MethodNode mn : new ArrayList<>(cn.methods)) {
             if (!"<clinit>".equals(mn.name) || !"()V".equals(mn.desc)) continue;
             if (config.isUseAnnotations() && !AnnotationFilter.hasClassNative(cn)) continue;
-            if (mn.instructions == null || countRealInsns(mn) <= 2) continue;
+            if (mn.instructions == null || countRealInsns(mn) <= 1) continue;
 
-            String helperName = "$hy_clinit";
-            boolean exists = cn.methods.stream().anyMatch(m -> helperName.equals(m.name));
-            if (exists) continue;
+            String helperName;
+            do {
+                helperName = "s_" + Long.toUnsignedString(rng.nextLong() & 0xFFFFFFFFL, 36);
+            } while (!usedNames.add(helperName));
 
             MethodNode helper = new MethodNode(
                     Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,

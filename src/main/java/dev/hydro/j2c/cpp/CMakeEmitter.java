@@ -111,11 +111,21 @@ endif()
     }
 
     public static String emitLinuxVersionScript() {
-        return "{\n    global: JNI_OnLoad;\n    local: *;\n};\n";
+        return emitLinuxVersionScript(false);
+    }
+
+    public static String emitLinuxVersionScript(boolean withUnload) {
+        return withUnload
+                ? "{\n    global:\n        JNI_OnLoad;\n        JNI_OnUnload;\n    local: *;\n};\n"
+                : "{\n    global: JNI_OnLoad;\n    local: *;\n};\n";
     }
 
     public static String emitMacOsExportsList() {
-        return "_JNI_OnLoad\n";
+        return emitMacOsExportsList(false);
+    }
+
+    public static String emitMacOsExportsList(boolean withUnload) {
+        return withUnload ? "_JNI_OnLoad\n_JNI_OnUnload\n" : "_JNI_OnLoad\n";
     }
 
     public static String emitBuildInstructions(String libBaseName) {

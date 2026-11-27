@@ -43,9 +43,9 @@ public class SessionController {
 
     @PostMapping("/session/logout")
     public Map<String, Object> logout(
-            @RequestBody Map<String, String> body,
+            @RequestBody LicenseSessionService.LogoutRequest req,
             HttpServletRequest httpReq) {
-        sessionService.logout(body.get("sessionId"), body.get("proof"), clientIp(httpReq));
+        sessionService.logout(req, clientIp(httpReq));
         return Map.of("ok", true);
     }
 

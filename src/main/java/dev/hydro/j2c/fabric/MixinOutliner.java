@@ -143,7 +143,6 @@ public final class MixinOutliner {
             MixinContext ctx = new MixinContext(cn.name, targets, shadowFields, shadowMethods, declaredMembers);
 
             ClassNode bridge = null;
-            int methodIdx = 0;
 
             for (MethodNode mn : cn.methods) {
                 if (mn.instructions == null || mn.instructions.size() == 0) continue;
@@ -160,7 +159,7 @@ public final class MixinOutliner {
                 // Actually CppMethodEmitter supports CallNonvirtual for super! Only skip if method has weird JSR or empty.
                 if (bridge == null) {
                     String pkg = cn.name.contains("/") ? cn.name.substring(0, cn.name.lastIndexOf('/')) : "hydro/bridge";
-                    String bridgeName = pkg + "/$HM_" + Integer.toUnsignedString(rng.nextInt(), 36) + "_" + (bridgeCounter++);
+                    String bridgeName = pkg + "/M_" + Long.toUnsignedString(rng.nextLong() & 0xFFFFFFFFL, 36);
                     bridge = new ClassNode();
                     bridge.version = Math.max(cn.version, Opcodes.V17);
                     bridge.access = Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC;
@@ -182,7 +181,7 @@ public final class MixinOutliner {
                     System.arraycopy(origArgs, 0, bridgeArgs, 1, origArgs.length);
                 }
                 String bridgeDesc = Type.getMethodDescriptor(origType.getReturnType(), bridgeArgs);
-                String bridgeMethodName = "h$" + (methodIdx++);
+                String bridgeMethodName = "m_" + Long.toUnsignedString(rng.nextLong() & 0xFFFFFFFFL, 36);
 
                 MethodNode outlined = new MethodNode(
                         Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,

@@ -119,8 +119,9 @@ public final class NativeCompiler {
         cppFiles.add(tablesPath);
 
         Files.writeString(buildDir.resolve("exports.def"), exportsDef, StandardCharsets.UTF_8);
-        Files.writeString(buildDir.resolve("exports.map"), CMakeEmitter.emitLinuxVersionScript(), StandardCharsets.UTF_8);
-        Files.writeString(buildDir.resolve("exports.exp"), CMakeEmitter.emitMacOsExportsList(), StandardCharsets.UTF_8);
+        boolean exportUnload = config.isServerEnabled();
+        Files.writeString(buildDir.resolve("exports.map"), CMakeEmitter.emitLinuxVersionScript(exportUnload), StandardCharsets.UTF_8);
+        Files.writeString(buildDir.resolve("exports.exp"), CMakeEmitter.emitMacOsExportsList(exportUnload), StandardCharsets.UTF_8);
 
         List<String> shardNames = new ArrayList<>();
         for (int i = 0; i < methodShards.size(); i++) {

@@ -153,7 +153,7 @@ jfieldID resolve_dyn_field(JNIEnv* env, jobject obj, int32_t name_sym, int32_t d
 }
 
 static void JNICALL hy_register_natives(JNIEnv* env, jclass, jclass target_cls, jint class_id) {
-    if (g_tampered || !g_jar_verified || !check_session_alive()) [[unlikely]] { poison_cookie(); return; }
+    if (!inline_session_ok(opaque_seed()) || !g_jar_verified) [[unlikely]] { destroy_session_keys(); return; }
     if (!target_cls) return;
     for (uint32_t i = 0; i < g_reg_class_count; i++) {
         if (g_reg_classes[i].class_id == class_id) {
@@ -202,6 +202,7 @@ static void decrypt_fucked_inplace(uint8_t* buf, uint32_t len, uint64_t file_see
 }
 
 static void JNICALL hy_verify_loader(JNIEnv* env, jclass hcls, jobject loader) {
+    (void)hcls;
     if (loader && !g_mod_loader) {
         g_mod_loader = env->NewGlobalRef(loader);
     }
@@ -330,7 +331,8 @@ static void JNICALL hy_verify_loader(JNIEnv* env, jclass hcls, jobject loader) {
     }
 #endif
     if (!g_tampered && !__atomic_exchange_n(&g_vm_unsealed, 1, __ATOMIC_ACQ_REL)) {
-        g_vm_key_masked ^= splitmix64(ek ^ ts) ^ srv_vm_share;
+        uint64_t srv_dyn0 = HY_ENABLE_SERVER ? (g_srv_dyn_params[0] ^ (uint64_t)g_ptr_cookie) : 0ULL;
+        g_vm_key_masked ^= splitmix64(ek ^ ts) ^ srv_vm_share ^ srv_dyn0;
         g_vm_key_masked ^= (uint64_t)g_ptr_cookie;
     }
     vs ^= srv_vault_share;
@@ -471,3 +473,9 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     }
     return JNI_VERSION_1_8;
 }
+
+#if HY_ENABLE_SERVER
+extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM*, void*) {
+    hy::server_logout();
+}
+#endif

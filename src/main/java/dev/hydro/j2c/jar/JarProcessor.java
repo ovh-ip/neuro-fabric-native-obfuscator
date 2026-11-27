@@ -153,12 +153,18 @@ public final class JarProcessor implements Opcodes {
                     }
                 }
             }
-            IndyLowerer.lowerClass(cn, nonNativeHelpers, eligibleSet);
+            IndyLowerer.lowerClass(cn, nonNativeHelpers, eligibleSet, rng);
             if (config.isOutlineConstructors() && !MixinOutliner.isMixinClass(cn, fabricMeta)) {
-                ConstructorOutliner.outlineConstructors(cn, config, outlinedCtorBodies);
+                ConstructorOutliner.outlineConstructors(cn, config, outlinedCtorBodies, rng);
                 eligibleSet.addAll(outlinedCtorBodies);
             }
             classEligibleMethods.put(cn, eligibleSet);
+        }
+
+        // Derive shared per-build dynamic server state bound into BOTH CFF dispatcher and Native VM
+        long[] srvDynParams = config.isServerEnabled() ? new long[8] : null;
+        if (srvDynParams != null) {
+            for (int d = 0; d < 8; d++) srvDynParams[d] = rng.nextLong();
         }
 
         // 3. Compile methods into Flattened C++ or Encrypted Native VM
@@ -221,7 +227,7 @@ public final class JarProcessor implements Opcodes {
                 try {
                     ControlFlowGraph cfg = ControlFlowGraph.build(mn, frames, rng);
                     String cpp = CppMethodEmitter.emitMethod(
-                            cn.name, mn, cFuncName, frames, cfg, mCtx, pool, crypto, config, rng);
+                            cn.name, mn, cFuncName, frames, cfg, mCtx, pool, crypto, config, srvDynParams, rng);
                     methodCpus.add(cpp);
                     regMethodsForClass.add(new CppRuntimeEmitter.RegisteredMethod(mn.name, mn.desc, cFuncName));
                     ClassRewriter.makeMethodNative(mn);
@@ -246,6 +252,10 @@ public final class JarProcessor implements Opcodes {
         for (ClassNode cn : classes.values()) {
             AnnotationFilter.cleanAnnotations(cn);
         }
+        // Encrypt residual strings and numeric literals in any non-native Java methods inside targetClasses
+        for (ClassNode cn : targetClasses) {
+            JavaPreHardener.hardenResidualBytecode(cn, rng);
+        }
 
         // 4. Populate junk classes, nested junk directories, and decoy .fucked blobs
         int dominantClassVersion = Opcodes.V17;
@@ -265,7 +275,7 @@ public final class JarProcessor implements Opcodes {
 
         byte[] loaderBytes = ClassRewriter.generateLoaderClass(
                 loaderInternal, regMethodName, verifyMethodName, bootMethodName,
-                libBaseName, embeddedResPath, dllEncKey, config);
+                libBaseName, embeddedResPath, dllEncKey, config, rng);
 
         Map<String, byte[]> finalClassBytes = new LinkedHashMap<>();
         List<ClassNode> fuckedCandidates = new ArrayList<>();
@@ -349,9 +359,9 @@ public final class JarProcessor implements Opcodes {
         CppRuntimeEmitter.GeneratedRuntime genRt = CppRuntimeEmitter.generateBuildRuntime(
                 pool, crypto, regClasses, fuckedEntries, vmMethods, vmIsa,
                 loaderInternal, regMethodName, verifyMethodName,
-                jarHash, vaultSaltBase, serverVmShare, productId, buildId, verifyResources, config);
+                jarHash, vaultSaltBase, serverVmShare, srvDynParams, productId, buildId, verifyResources, config);
         shards.addAll(genRt.vmStubShards());
-        String exportsDef = CppRuntimeEmitter.emitExportsDef();
+        String exportsDef = CppRuntimeEmitter.emitExportsDef(config.isServerEnabled());
 
         byte[] symBlobBytes = concatSymBlob(pool);
 
@@ -359,7 +369,7 @@ public final class JarProcessor implements Opcodes {
         if (config.isServerEnabled()) {
             StringBuilder dynHex = new StringBuilder();
             for (int d = 0; d < 8; d++) {
-                dynHex.append(dev.hydro.j2c.crypto.HydroCrypto.hex64Padded(rng.nextLong()));
+                dynHex.append(dev.hydro.j2c.crypto.HydroCrypto.hex64Padded(srvDynParams[d]));
             }
             String manifestJson = """
                     {

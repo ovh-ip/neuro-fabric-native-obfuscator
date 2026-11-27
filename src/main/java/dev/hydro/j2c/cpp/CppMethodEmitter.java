@@ -37,6 +37,21 @@ public final class CppMethodEmitter implements Opcodes {
             CryptoEngine crypto,
             ObfuscationConfig config,
             Random rng) {
+        return emitMethod(ownerInternal, mn, cFuncName, frames, cfg, mixinCtx, pool, crypto, config, null, rng);
+    }
+
+    public static String emitMethod(
+            String ownerInternal,
+            MethodNode mn,
+            String cFuncName,
+            Frame<FrameAnalyzer.TypedValue>[] frames,
+            ControlFlowGraph cfg,
+            MixinOutliner.MixinContext mixinCtx,
+            SymbolPool pool,
+            CryptoEngine crypto,
+            ObfuscationConfig config,
+            long[] srvDynParams,
+            Random rng) {
 
         boolean strong = config.getTier() != ObfuscationConfig.ProtectionTier.FAST;
         boolean useBogus = config.getTier() != ObfuscationConfig.ProtectionTier.FAST;
@@ -53,10 +68,10 @@ public final class CppMethodEmitter implements Opcodes {
         }
         sb.append(") {\n");
 
-        // Runtime ref pool & opaque seed & live server session check
+        // Runtime ref pool & opaque seed & distributed inline session guard
         sb.append("    hy::RefTable _refs(env);\n");
         sb.append("    uint64_t _op = hy::opaque_seed();\n");
-        sb.append("    if (!hy::check_session_alive()) [[unlikely]] return").append(defaultRetExpr(retType)).append(";\n");
+        sb.append("    if (!hy::inline_session_ok(_op)) [[unlikely]] return").append(defaultRetExpr(retType)).append(";\n");
 
         // Track which local slots & kinds exist
         boolean[] needI = new boolean[Math.max(1, mn.maxLocals + 4)];
@@ -141,7 +156,18 @@ public final class CppMethodEmitter implements Opcodes {
 
         int stateMask = rng.nextInt() | 1;
         int entryState = cfg.blocks.get(0).stateId ^ stateMask;
-        sb.append("    uint32_t _st = (uint32_t)").append(crypto.mbaConst32(entryState, strong)).append(";\n");
+        if (srvDynParams != null && srvDynParams.length == 8) {
+            int dynIdx = rng.nextInt(8);
+            long dynVal = srvDynParams[dynIdx];
+            int dynMask32 = (int) (dynVal ^ (dynVal >>> 32));
+            entryState ^= dynMask32;
+            sb.append("    uint32_t _st = ((uint32_t)").append(crypto.mbaConst32(entryState, strong))
+              .append(") ^ ((uint32_t)(((hy::g_srv_dyn_params[").append(dynIdx)
+              .append("] ^ (uint64_t)hy::g_ptr_cookie) ^ ((hy::g_srv_dyn_params[").append(dynIdx)
+              .append("] ^ (uint64_t)hy::g_ptr_cookie) >> 32)) & 0xFFFFFFFFULL));\n");
+        } else {
+            sb.append("    uint32_t _st = (uint32_t)").append(crypto.mbaConst32(entryState, strong)).append(";\n");
+        }
         sb.append("    uint32_t _sm = (uint32_t)").append(crypto.mbaConst32(stateMask, strong)).append(";\n");
 
         // Prepare shuffled blocks + adaptive bogus decoy blocks (prevents huge-method explosion while stopping short-method folding)

@@ -35,6 +35,9 @@ public class SessionRecord {
     @Column(nullable = false, length = 64)
     private String rollingKeyHex;
 
+    @Column(nullable = false, length = 32)
+    private String sessionGuardHex = "";
+
     @Column(nullable = false, length = 64)
     private String clientPubHex;
 
@@ -74,6 +77,8 @@ public class SessionRecord {
     public void setMacKeyHex(String macKeyHex) { this.macKeyHex = macKeyHex; }
     public String getRollingKeyHex() { return rollingKeyHex; }
     public void setRollingKeyHex(String rollingKeyHex) { this.rollingKeyHex = rollingKeyHex; }
+    public String getSessionGuardHex() { return sessionGuardHex; }
+    public void setSessionGuardHex(String sessionGuardHex) { this.sessionGuardHex = sessionGuardHex; }
     public String getClientPubHex() { return clientPubHex; }
     public void setClientPubHex(String clientPubHex) { this.clientPubHex = clientPubHex; }
     public long getSeq() { return seq; }

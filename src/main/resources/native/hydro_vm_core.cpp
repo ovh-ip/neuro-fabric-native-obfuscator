@@ -94,9 +94,9 @@ uint64_t vm_exec_core(
         int32_t init_slots, jobject* out_ref) {
 
     if (out_ref) *out_ref = nullptr;
-    if (g_tampered || !check_session_alive()) [[unlikely]] return 0;
-
     const uint64_t _op = opaque_seed();
+    if (!inline_session_ok(_op)) [[unlikely]] return 0;
+
     const VmMethodMeta& mm = g_vm_methods[vm_method_id];
     RefTable refs(env);
     const uint64_t mix_const = HY_MBA_VM_MIX_CONST(_op);
@@ -207,7 +207,7 @@ uint64_t vm_exec_core(
 
 #ifdef HY_OP_NOP
     while (pc < mm.code_len) {
-        if ((++step_cnt & 63u) == 1u) [[unlikely]] { if (g_tampered || !check_session_alive()) { cleanup(); return 0; } }
+        if ((++step_cnt & 63u) == 1u) [[unlikely]] { if (!inline_session_ok(_op)) { cleanup(); return 0; } }
         if ((step_cnt & 1023u) == 511u) [[unlikely]] { run_periodic_vm_guard(); }
         cur_insn_pc = pc;
         uint8_t op = (uint8_t)(rd_u8() ^ mm.op_mask ^ (uint8_t)((cur_insn_pc * mm.pc_mul) & 0xFFu));

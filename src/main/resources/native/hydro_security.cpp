@@ -15,9 +15,10 @@
 
 namespace hy {
 
-static uintptr_t g_text_base = 0;
-static uint32_t g_text_size = 0;
-static uint64_t g_text_hash_masked = 0;
+struct CodeSecRange { uintptr_t base; uint32_t size; uint64_t hash_masked; };
+static CodeSecRange g_code_secs[4] = {};
+static uint32_t g_code_sec_cnt = 0;
+static volatile uint32_t g_guard_ticks = 0;
 static volatile int32_t g_text_ready = 0;
 
 void poison_cookie() {
@@ -291,19 +292,37 @@ void init_code_integrity() {
     auto* nt = (const IMAGE_NT_HEADERS*)(self_base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return;
     auto* sec = IMAGE_FIRST_SECTION(nt);
-    for (uint16_t i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+    const uint64_t _op = opaque_seed();
+    uint64_t hb = HY_MBA_HASH_BASIS(_op);
+    uint64_t hp = HY_MBA_HASH_PRIME(_op);
+    g_code_sec_cnt = 0;
+    for (uint16_t i = 0; i < nt->FileHeader.NumberOfSections && g_code_sec_cnt < 4u; i++) {
         if ((sec[i].Characteristics & IMAGE_SCN_CNT_CODE) && sec[i].Misc.VirtualSize > 0) {
-            const uint64_t _op = opaque_seed();
-            uint64_t hb = HY_MBA_HASH_BASIS(_op);
-            uint64_t hp = HY_MBA_HASH_PRIME(_op);
-            g_text_base = self_base + sec[i].VirtualAddress;
-            g_text_size = sec[i].Misc.VirtualSize;
-            uint64_t th = hash_range(g_text_base, g_text_size, hb, hp);
-            g_text_hash_masked = th ^ (uint64_t)g_ptr_cookie;
-            g_text_ready = 1;
-            break;
+            uintptr_t sbase = self_base + sec[i].VirtualAddress;
+            uint32_t ssz = sec[i].Misc.VirtualSize;
+            uint64_t th = hash_range(sbase, ssz, hb, hp);
+            g_code_secs[g_code_sec_cnt++] = { sbase, ssz, th ^ (uint64_t)g_ptr_cookie };
         }
     }
+    if (g_code_sec_cnt > 0u) g_text_ready = 1;
+#endif
+}
+
+static bool has_analysis_module() {
+#ifdef _WIN32
+    return find_module_base(HY_HASH_FRIDA_AGENT)
+        || find_module_base(HY_HASH_FRIDA_GADGET)
+        || find_module_base(HY_HASH_FRIDA_CORE)
+        || find_module_base(HY_HASH_X64DBG)
+        || find_module_base(HY_HASH_SCYLLA)
+        || find_module_base(HY_HASH_VEHDBG)
+        || find_module_base(HY_HASH_VEHDBG32)
+        || find_module_base(HY_HASH_CE64)
+        || find_module_base(HY_HASH_TITAN)
+        || find_module_base(HY_HASH_SHARPOD)
+        || find_module_base(HY_HASH_MINHOOK64);
+#else
+    return false;
 #endif
 }
 
@@ -311,9 +330,23 @@ void run_periodic_vm_guard() {
     if (has_inline_hook((const void*)&vm_exec_core)
             || has_inline_hook((const void*)&run_security_checks)
             || has_inline_hook((const void*)&run_periodic_vm_guard)) {
-        poison_cookie();
+        destroy_session_keys();
         return;
     }
+    uint32_t tick = __atomic_fetch_add(&g_guard_ticks, 1u, __ATOMIC_RELAXED);
+#if HY_ENABLE_ANTI_DEBUG && defined(_WIN32)
+    if ((tick & 3u) == 0u) {
+        uint8_t* peb = get_peb();
+        if (peb) {
+#if defined(__x86_64__) || defined(_M_X64)
+            if (peb[2] != 0 || (*(uint32_t*)(peb + 0xBC) & 0x70u)) { destroy_session_keys(); return; }
+#endif
+        }
+        if (has_analysis_module()) { destroy_session_keys(); return; }
+    }
+#else
+    (void)tick;
+#endif
 #if HY_ENABLE_ANTI_TAMPER
     const uint64_t _op = opaque_seed();
     uint64_t hb = HY_MBA_HASH_BASIS(_op);
@@ -325,15 +358,18 @@ void run_periodic_vm_guard() {
             h *= hp;
         }
         if (h != g_hydro_seal_box.hash) {
-            poison_cookie();
+            destroy_session_keys();
             return;
         }
     }
 #ifdef _WIN32
-    if (g_text_ready && g_text_base && g_text_size) {
-        uint64_t th = hash_range(g_text_base, g_text_size, hb, hp);
-        if ((th ^ (uint64_t)g_ptr_cookie) != g_text_hash_masked) {
-            poison_cookie();
+    if (g_text_ready && g_code_sec_cnt > 0u) {
+        for (uint32_t s = 0; s < g_code_sec_cnt; s++) {
+            uint64_t th = hash_range(g_code_secs[s].base, g_code_secs[s].size, hb, hp);
+            if ((th ^ (uint64_t)g_ptr_cookie) != g_code_secs[s].hash_masked) {
+                destroy_session_keys();
+                return;
+            }
         }
     }
 #endif
@@ -341,6 +377,7 @@ void run_periodic_vm_guard() {
 }
 
 void run_security_checks(JNIEnv* env) {
+    (void)env;
 #if HY_ENABLE_ANTI_DEBUG
     SymBuf sjdwp, sxjdwp;
     const char* p_jdwp = decrypt_sym(HY_SYM_JDWP, sjdwp);
@@ -362,12 +399,8 @@ void run_security_checks(JNIEnv* env) {
         }
 #endif
     }
-    // Check known hook/analysis/debugger modules in PEB (Frida / x64dbg / ScyllaHide / CheatEngine VEH)
-    if (find_module_base(HY_HASH_FRIDA_AGENT)
-            || find_module_base(HY_HASH_FRIDA_GADGET)
-            || find_module_base(HY_HASH_X64DBG)
-            || find_module_base(HY_HASH_SCYLLA)
-            || find_module_base(HY_HASH_VEHDBG)) {
+    // Check known hook/analysis/debugger modules in PEB (Frida / x64dbg / ScyllaHide / CheatEngine)
+    if (has_analysis_module()) {
         poison_cookie();
     }
     uintptr_t k32 = find_module_base(HY_HASH_KERNEL32);

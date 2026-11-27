@@ -6,10 +6,24 @@
 namespace hy {
 
 volatile uint64_t g_srv_dyn_params[8] = {};
+volatile uint64_t g_sess_state_masked = 0;
+volatile uint64_t g_sess_deadline_masked = 0;
+volatile uint64_t g_hb_pulse_masked = 0;
+volatile uint64_t g_hb_silence_limit_ms = 0;
+
+void destroy_session_keys() {
+    poison_cookie();
+}
+
+bool verify_session_window() {
+    return g_tampered == 0;
+}
 
 bool check_session_alive() {
     return g_tampered == 0;
 }
+
+void server_logout() {}
 
 } // namespace hy
 
@@ -17,10 +31,8 @@ bool check_session_alive() {
 
 #ifdef _WIN32
 #include <windows.h>
-#include <stdio.h>
 #else
 #include <stdlib.h>
-#include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
@@ -36,21 +48,36 @@ bool check_session_alive() {
 
 namespace hy {
 
-// Active rolling session state (protected/masked in memory)
-static volatile uint64_t g_session_deadline_ms = 0;
-static volatile int32_t g_session_established = 0;
-static volatile int32_t g_session_revoked = 0;
+volatile uint64_t g_srv_dyn_params[8] = {};
+volatile uint64_t g_sess_state_masked = 0;
+volatile uint64_t g_sess_deadline_masked = 0;
+volatile uint64_t g_hb_pulse_masked = 0;
+volatile uint64_t g_hb_silence_limit_ms = 0;
+
 static volatile uint32_t g_hb_interval_sec = 15;
+static volatile uint32_t g_lease_sec = 45;
+static volatile int32_t g_hb_stop = 0;
+static volatile int32_t g_net_lock = 0;
+static volatile uint64_t g_mem_epoch_salt = 0x517CC1B727220A95ULL;
+static volatile uint64_t g_sess_wall_anchor_s = 0;
+static volatile uint64_t g_sess_mono_anchor_ms = 0;
+
 static uint8_t g_enc_key_masked[32] = {};
 static uint8_t g_mac_key_masked[32] = {};
 static uint8_t g_rolling_key_masked[32] = {};
+static uint8_t g_guard_masked[8] = {};
 static char g_session_id[72] = {};
 static char g_cached_hwid[65] = {};
 static char g_cached_jar_hex[17] = {};
-static char g_cached_sym_hex[17] = {};
 static uint64_t g_session_seq = 0;
 
-volatile uint64_t g_srv_dyn_params[8] = {};
+static inline void net_lock_acquire() {
+    while (__atomic_exchange_n(&g_net_lock, 1, __ATOMIC_ACQUIRE) != 0) {}
+}
+
+static inline void net_lock_release() {
+    __atomic_store_n(&g_net_lock, 0, __ATOMIC_RELEASE);
+}
 
 static uint64_t monotonic_ms() {
 #ifdef _WIN32
@@ -73,32 +100,157 @@ static uint64_t epoch_sec() {
 #endif
 }
 
-static void xor_mask_32(uint8_t dst[32], const uint8_t src[32]) {
-    uint64_t c = (uint64_t)g_ptr_cookie ^ g_rt_entropy;
-    for (int i = 0; i < 32; i++) {
-        dst[i] = src[i] ^ (uint8_t)((splitmix64(c + (uint64_t)i * 0x9E3779B97F4A7C15ULL) >> ((i & 7) * 8)) & 0xFFu);
+static void xor_mask_buf(uint8_t* dst, const uint8_t* src, size_t n, uint64_t epoch_salt) {
+    uint64_t c = (uint64_t)g_ptr_cookie ^ g_rt_entropy ^ epoch_salt;
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = src[i] ^ (uint8_t)((splitmix64(c + (uint64_t)i * 0x9E3779B97F4A7C15ULL) >> ((i & 7u) * 8u)) & 0xFFu);
     }
 }
 
-bool check_session_alive() {
-    if (g_tampered || g_session_revoked || !g_session_established) return false;
-    uint64_t now = monotonic_ms();
-    uint64_t dl = __atomic_load_n(&g_session_deadline_ms, __ATOMIC_ACQUIRE);
-    if (now > dl) {
-        g_session_revoked = 1;
-        poison_cookie();
-        return false;
+void destroy_session_keys() {
+    __atomic_store_n(&g_sess_state_masked, 0ULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_sess_deadline_masked, 0ULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_hb_pulse_masked, 0ULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_hb_stop, 1, __ATOMIC_RELEASE);
+    poison_cookie();
+    for (int i = 0; i < 8; i++) {
+        g_srv_dyn_params[i] ^= splitmix64((uint64_t)g_ptr_cookie + (uint64_t)i * 0xD6E8FEB86659FD93ULL);
     }
+    secure_wipe(g_enc_key_masked, sizeof(g_enc_key_masked));
+    secure_wipe(g_mac_key_masked, sizeof(g_mac_key_masked));
+    secure_wipe(g_rolling_key_masked, sizeof(g_rolling_key_masked));
+    secure_wipe(g_guard_masked, sizeof(g_guard_masked));
+    secure_wipe(g_session_id, sizeof(g_session_id));
+}
+
+bool verify_session_window() {
+    uint64_t now_m = monotonic_ms();
+    uint64_t c = (uint64_t)g_ptr_cookie;
+    uint64_t dl = __atomic_load_n(&g_sess_deadline_masked, __ATOMIC_ACQUIRE) ^ c;
+    uint64_t last_pulse = __atomic_load_n(&g_hb_pulse_masked, __ATOMIC_ACQUIRE) ^ c;
+    uint64_t silence_lim = __atomic_load_n(&g_hb_silence_limit_ms, __ATOMIC_ACQUIRE);
+    if (now_m > dl) return false;
+    if (now_m > last_pulse && (now_m - last_pulse) > silence_lim) return false;
     return true;
+}
+
+bool check_session_alive() {
+    return inline_session_ok(opaque_seed());
+}
+
+// Compact libc/stdio-free format helpers so binary imports stay free of vfprintf/stdio
+static inline void append_char(char* dst, size_t cap, size_t& pos, char ch) {
+    if (pos + 1u < cap) dst[pos++] = ch;
+    if (cap > 0u) dst[pos] = '\0';
+}
+
+static inline void append_cstr(char* dst, size_t cap, size_t& pos, const char* s) {
+    if (!s) return;
+    while (*s && pos + 1u < cap) dst[pos++] = *s++;
+    if (cap > 0u) dst[pos] = '\0';
+}
+
+static void append_u64(char* dst, size_t cap, size_t& pos, uint64_t v) {
+    char tmp[24];
+    int n = 0;
+    do {
+        tmp[n++] = (char)('0' + (v % 10ULL));
+        v /= 10ULL;
+    } while (v > 0ULL && n < 24);
+    for (int i = n - 1; i >= 0; i--) append_char(dst, cap, pos, tmp[i]);
+}
+
+static void u64_to_hex16(uint64_t v, char out[17]) {
+    volatile uint8_t hx_off = 0;
+    for (int i = 15; i >= 0; i--) {
+        uint8_t nib = (uint8_t)(v & 0xFu);
+        out[i] = (char)(nib < 10u ? ('0' + nib + hx_off) : ('a' + (nib - 10u) + hx_off));
+        v >>= 4;
+    }
+    out[16] = '\0';
+}
+
+static void append_json_str(char* dst, size_t cap, size_t& pos, char key, const char* val, bool comma) {
+    append_char(dst, cap, pos, '\"');
+    append_char(dst, cap, pos, key);
+    append_char(dst, cap, pos, '\"');
+    append_char(dst, cap, pos, ':');
+    append_char(dst, cap, pos, '\"');
+    append_cstr(dst, cap, pos, val);
+    append_char(dst, cap, pos, '\"');
+    if (comma) append_char(dst, cap, pos, ',');
+}
+
+static void append_json_u64(char* dst, size_t cap, size_t& pos, char key, uint64_t val, bool comma) {
+    append_char(dst, cap, pos, '\"');
+    append_char(dst, cap, pos, key);
+    append_char(dst, cap, pos, '\"');
+    append_char(dst, cap, pos, ':');
+    append_u64(dst, cap, pos, val);
+    if (comma) append_char(dst, cap, pos, ',');
+}
+
+static uint64_t parse_u64_prefix(const char* s) {
+    if (!s) return 0;
+    uint64_t v = 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10ULL + (uint64_t)(*s - '0');
+        s++;
+    }
+    return v;
+}
+
+static bool split_pipes(char* s, char** out, int expected) {
+    int cnt = 0;
+    out[cnt++] = s;
+    for (char* p = s; *p; p++) {
+        if (*p == '|') {
+            *p = '\0';
+            if (cnt >= expected) return false;
+            out[cnt++] = p + 1;
+        }
+    }
+    return cnt == expected;
+}
+
+static bool json_get_key_str(const char* json, char key, char* out, size_t cap) {
+    if (!json || cap == 0u) return false;
+    for (const char* p = json; *p; p++) {
+        if (p[0] == '\"' && p[1] == key && p[2] == '\"') {
+            const char* q = p + 3;
+            while (*q == ' ' || *q == '\t' || *q == ':') q++;
+            if (*q != '\"') continue;
+            q++;
+            size_t n = 0;
+            while (*q && *q != '\"' && n + 1u < cap) {
+                if (*q == '\\' && q[1]) q++;
+                out[n++] = *q++;
+            }
+            out[n] = '\0';
+            return *q == '\"';
+        }
+    }
+    return false;
+}
+
+static uint64_t live_sym_digest() {
+    const uint64_t _op = opaque_seed();
+    uint64_t sh = HY_MBA_HASH_BASIS(_op);
+    uint64_t hp = HY_MBA_HASH_PRIME(_op);
+    for (uint32_t i = 0; i < g_sym_blob_size; i++) {
+        sh ^= g_sym_blob[i];
+        sh *= hp;
+    }
+    return sh;
 }
 
 static void compute_hwid(char out_hex[65]) {
     uint8_t acc[512];
     size_t pos = 0;
     auto push_bytes = [&](const void* p, size_t n) {
-        if (!p || n == 0) return;
+        if (!p || n == 0u) return;
         size_t take = (pos + n <= sizeof(acc)) ? n : (sizeof(acc) - pos);
-        if (take > 0) { memcpy(acc + pos, p, take); pos += take; }
+        if (take > 0u) { memcpy(acc + pos, p, take); pos += take; }
     };
 #ifdef _WIN32
     uintptr_t hAdv = load_sys_module(HY_HASH_ADVAPI32, HY_SYM_ADVAPI32_DLL);
@@ -113,7 +265,7 @@ static void compute_hwid(char out_hex[65]) {
         auto pQuery = (FnQuery)resolve_export(hAdv, HY_HASH_REG_QUERY);
         auto pClose = (FnClose)resolve_export(hAdv, HY_HASH_REG_CLOSE);
         HKEY hk = nullptr;
-        if (pOpen && pQuery && pClose && pOpen(HKEY_LOCAL_MACHINE, regPath, 0, 0x20019 /* KEY_READ */, &hk) == 0) {
+        if (pOpen && pQuery && pClose && pOpen(HKEY_LOCAL_MACHINE, regPath, 0, 0x20019, &hk) == 0) {
             uint8_t rbuf[128] = {};
             DWORD rsz = sizeof(rbuf);
             if (pQuery(hk, valName, nullptr, nullptr, rbuf, &rsz) == 0 && rsz > 0) push_bytes(rbuf, rsz);
@@ -180,7 +332,7 @@ static bool parse_url(const char* url, bool& is_https, char* host, size_t hcap, 
     host[hlen] = '\0';
 
     if (colon) {
-        int pv = atoi(colon + 1);
+        uint64_t pv = parse_u64_prefix(colon + 1);
         port = (uint16_t)(pv > 0 && pv <= 65535 ? pv : (is_https ? 443 : 80));
     } else {
         port = is_https ? 443 : 80;
@@ -204,7 +356,9 @@ static bool http_post_json(const char* base_url, const char* route, const char* 
     char host[256] = {}, bpath[256] = {}, full_path[512] = {};
     uint16_t port = 80;
     if (!parse_url(base_url, is_https, host, sizeof(host), port, bpath, sizeof(bpath))) return false;
-    snprintf(full_path, sizeof(full_path), "%s%s", bpath, route);
+    size_t fpos = 0;
+    append_cstr(full_path, sizeof(full_path), fpos, bpath);
+    append_cstr(full_path, sizeof(full_path), fpos, route);
     size_t body_len = strlen(json_body);
 
 #ifdef _WIN32
@@ -246,13 +400,13 @@ static bool http_post_json(const char* base_url, const char* route, const char* 
     wchar_t wmethod[5] = {};
     for (int i = 0; i < 4; i++) wmethod[i] = (wchar_t)(wm[i] ^ vk);
 
-    HINTERNET hSess = pOpen(wua, 0 /* WINHTTP_ACCESS_TYPE_DEFAULT_PROXY */, nullptr, nullptr, 0);
+    HINTERNET hSess = pOpen(wua, 0, nullptr, nullptr, 0);
     if (!hSess) return false;
     if (pTimeouts) pTimeouts(hSess, 4000, 4000, 5000, 5000);
     HINTERNET hConn = pConn(hSess, whost, port, 0);
     if (!hConn) { pClose(hSess); return false; }
 
-    DWORD flags = is_https ? 0x00800000u /* WINHTTP_FLAG_SECURE */ : 0u;
+    DWORD flags = is_https ? 0x00800000u : 0u;
     HINTERNET hReq = pReq(hConn, wmethod, wpath, nullptr, nullptr, nullptr, flags);
     if (!hReq) { pClose(hConn); pClose(hSess); return false; }
 
@@ -260,7 +414,7 @@ static bool http_post_json(const char* base_url, const char* route, const char* 
     if (ok) ok = pRecv(hReq, nullptr);
     if (ok) {
         DWORD status = 0, ssz = sizeof(status);
-        pHdr(hReq, 19u | 0x20000000u /* WINHTTP_QUERY_STATUS_CODE | FLAG_NUMBER */, nullptr, &status, &ssz, nullptr);
+        pHdr(hReq, 19u | 0x20000000u, nullptr, &status, &ssz, nullptr);
         out_status = (int)status;
         size_t total = 0;
         for (;;) {
@@ -278,9 +432,10 @@ static bool http_post_json(const char* base_url, const char* route, const char* 
     pClose(hReq); pClose(hConn); pClose(hSess);
     return ok && out_status >= 200 && out_status < 300;
 #else
-    if (is_https) return false; // POSIX builds use TLS-terminating proxy or plain HTTP over encrypted E2EE payload
+    if (is_https) return false;
     char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+    size_t pp = 0;
+    append_u64(port_str, sizeof(port_str), pp, port);
     struct addrinfo hints = {}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -298,12 +453,20 @@ static bool http_post_json(const char* base_url, const char* route, const char* 
     freeaddrinfo(res);
     if (fd < 0) return false;
 
-    char* req_buf = (char*)heap_alloc(body_len + 1024);
-    int hdr_len = snprintf(req_buf, body_len + 1024,
-            "POST %s HTTP/1.1\r\nHost: %s:%u\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
-            full_path, host, (unsigned)port, body_len);
-    memcpy(req_buf + hdr_len, json_body, body_len);
-    size_t total_send = (size_t)hdr_len + body_len;
+    size_t req_cap = body_len + 1024u;
+    char* req_buf = (char*)heap_alloc(req_cap);
+    size_t hp = 0;
+    append_cstr(req_buf, req_cap, hp, "POST ");
+    append_cstr(req_buf, req_cap, hp, full_path);
+    append_cstr(req_buf, req_cap, hp, " HTTP/1.1\r\nHost: ");
+    append_cstr(req_buf, req_cap, hp, host);
+    append_char(req_buf, req_cap, hp, ':');
+    append_u64(req_buf, req_cap, hp, port);
+    append_cstr(req_buf, req_cap, hp, "\r\nContent-Type: application/json\r\nContent-Length: ");
+    append_u64(req_buf, req_cap, hp, body_len);
+    append_cstr(req_buf, req_cap, hp, "\r\nConnection: close\r\n\r\n");
+    if (hp + body_len <= req_cap) memcpy(req_buf + hp, json_body, body_len);
+    size_t total_send = hp + body_len;
     size_t sent = 0;
     while (sent < total_send) {
         ssize_t n = send(fd, req_buf + sent, total_send - sent, 0);
@@ -312,7 +475,7 @@ static bool http_post_json(const char* base_url, const char* route, const char* 
     }
     heap_free(req_buf);
 
-    size_t raw_cap = resp_cap + 2048;
+    size_t raw_cap = resp_cap + 2048u;
     char* raw = (char*)heap_alloc(raw_cap);
     size_t rtot = 0;
     while (rtot + 1 < raw_cap) {
@@ -324,7 +487,7 @@ static bool http_post_json(const char* base_url, const char* route, const char* 
     close(fd);
 
     const char* sp = strchr(raw, ' ');
-    if (sp) out_status = atoi(sp + 1);
+    if (sp) out_status = (int)parse_u64_prefix(sp + 1);
     const char* sep = strstr(raw, "\r\n\r\n");
     if (sep) {
         const char* body = sep + 4;
@@ -338,36 +501,17 @@ static bool http_post_json(const char* base_url, const char* route, const char* 
 #endif
 }
 
-static bool json_get_str(const char* json, const char* key, char* out, size_t cap) {
-    char pat[128];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char* p = strstr(json, pat);
-    if (!p) return false;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\t' || *p == ':') p++;
-    if (*p != '"') return false;
-    p++;
-    size_t n = 0;
-    while (*p && *p != '"' && n + 1 < cap) {
-        if (*p == '\\' && p[1]) p++;
-        out[n++] = *p++;
-    }
-    out[n] = '\0';
-    return *p == '"';
-}
-
 static void resolve_license_key(JNIEnv* env, char* out, size_t cap) {
     out[0] = '\0';
-    // 1. Optional baked key in symbol table
     if (HY_HAS_BAKED_LIC) {
         SymBuf sb;
         const char* bk = decrypt_sym(HY_SYM_BAKED_LIC, sb);
         if (bk && *bk) {
-            snprintf(out, cap, "%s", bk);
+            size_t p = 0;
+            append_cstr(out, cap, p, bk);
             return;
         }
     }
-    // 2. JVM property: -Dhydro.key=...
     if (env) {
         SymBuf sc, sm, sd, sp;
         jclass sysCls = find_class_by_sym(env, HY_SYM_SYS_CLS);
@@ -376,10 +520,13 @@ static void resolve_license_key(JNIEnv* env, char* out, size_t cap) {
             if (mid && !env->ExceptionCheck()) {
                 jstring jkey = env->NewStringUTF(decrypt_sym(HY_SYM_PROP_KEY, sp));
                 jstring jval = (jstring)env->CallStaticObjectMethod(sysCls, mid, jkey);
-                if (env->ExceptionCheck()) { env->ExceptionClear(); }
+                if (env->ExceptionCheck()) env->ExceptionClear();
                 if (jval) {
                     const char* utf = env->GetStringUTFChars(jval, nullptr);
-                    if (utf && *utf) snprintf(out, cap, "%s", utf);
+                    if (utf && *utf) {
+                        size_t p = 0;
+                        append_cstr(out, cap, p, utf);
+                    }
                     if (utf) env->ReleaseStringUTFChars(jval, utf);
                     env->DeleteLocalRef(jval);
                 }
@@ -389,159 +536,294 @@ static void resolve_license_key(JNIEnv* env, char* out, size_t cap) {
         }
         if (out[0] != '\0') return;
     }
-    // 3. Environment variable HYDRO_LICENSE_KEY
     {
         SymBuf se;
         const char* evName = decrypt_sym(HY_SYM_ENV_KEY, se);
 #ifdef _WIN32
         char ebuf[256] = {};
         if (GetEnvironmentVariableA(evName, ebuf, sizeof(ebuf)) > 0) {
-            snprintf(out, cap, "%s", ebuf);
+            size_t p = 0;
+            append_cstr(out, cap, p, ebuf);
             secure_wipe(ebuf, sizeof(ebuf));
             return;
         }
 #else
         const char* ev = getenv(evName);
-        if (ev && *ev) { snprintf(out, cap, "%s", ev); return; }
+        if (ev && *ev) { size_t p = 0; append_cstr(out, cap, p, ev); return; }
 #endif
     }
-    // 4. Local key file (e.g. hydro.key)
     {
         SymBuf sf;
-        FILE* f = fopen(decrypt_sym(HY_SYM_LIC_FILE, sf), "rb");
-        if (f) {
-            size_t n = fread(out, 1, cap - 1, f);
-            fclose(f);
-            out[n] = '\0';
-            while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' ' || out[n - 1] == '\t')) {
-                out[--n] = '\0';
+        const char* path = decrypt_sym(HY_SYM_LIC_FILE, sf);
+#ifdef _WIN32
+        uintptr_t k32 = find_module_base(HY_HASH_KERNEL32);
+        using FnCreateFileA = HANDLE(WINAPI*)(const char*, DWORD, DWORD, void*, DWORD, DWORD, HANDLE);
+        using FnReadFile = BOOL(WINAPI*)(HANDLE, void*, DWORD, LPDWORD, void*);
+        using FnCloseHandle = BOOL(WINAPI*)(HANDLE);
+        auto pCF = (FnCreateFileA)resolve_export(k32, HY_HASH_CREATEFILEA);
+        auto pRF = (FnReadFile)resolve_export(k32, HY_HASH_READFILE);
+        auto pCH = (FnCloseHandle)resolve_export(k32, HY_HASH_CLOSEHANDLE);
+        if (pCF && pRF && pCH) {
+            HANDLE hf = pCF(path, 0x80000000u /* GENERIC_READ */, 1u /* FILE_SHARE_READ */, nullptr, 3u /* OPEN_EXISTING */, 0x80u, nullptr);
+            if (hf && hf != (HANDLE)(uintptr_t)-1) {
+                DWORD got = 0;
+                if (pRF(hf, out, (DWORD)(cap - 1u), &got, nullptr) && got > 0) {
+                    size_t n = (size_t)got;
+                    out[n] = '\0';
+                    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' ' || out[n - 1] == '\t')) out[--n] = '\0';
+                }
+                pCH(hf);
             }
         }
+#else
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t rd = read(fd, out, cap - 1u);
+            close(fd);
+            if (rd > 0) {
+                size_t n = (size_t)rd;
+                out[n] = '\0';
+                while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' ' || out[n - 1] == '\t')) out[--n] = '\0';
+            }
+        }
+#endif
     }
 }
 
+static void derive_ratchet_keys(const uint8_t secret32[32], uint8_t ek[32], uint8_t mk[32], uint8_t rk[32], uint8_t gd[8]) {
+    uint8_t le = 'E', lm = 'M', lr = 'R', lg = 'G';
+    hkdf_expand(secret32, &le, 1, ek, 32);
+    hkdf_expand(secret32, &lm, 1, mk, 32);
+    hkdf_expand(secret32, &lr, 1, rk, 32);
+    hkdf_expand(secret32, &lg, 1, gd, 8);
+}
+
 static bool send_heartbeat_once() {
-    if (!g_session_established || g_session_revoked || g_tampered) return false;
+    net_lock_acquire();
+    if (g_tampered || __atomic_load_n(&g_hb_stop, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_sess_state_masked, __ATOMIC_ACQUIRE) == 0ULL) {
+        net_lock_release();
+        return false;
+    }
+
+    uint64_t esalt = __atomic_load_n(&g_mem_epoch_salt, __ATOMIC_ACQUIRE);
     uint64_t next_seq = g_session_seq + 1ULL;
     uint64_t ts = epoch_sec();
-
-    // Compute live symDigest dynamically
-    const uint64_t _op = opaque_seed();
-    uint64_t sh = HY_MBA_HASH_BASIS(_op);
-    uint64_t hp = HY_MBA_HASH_PRIME(_op);
-    for (uint32_t i = 0; i < g_sym_blob_size; i++) { sh ^= g_sym_blob[i]; sh *= hp; }
     char live_sym[17];
-    snprintf(live_sym, sizeof(live_sym), "%016llx", (unsigned long long)sh);
+    u64_to_hex16(live_sym_digest(), live_sym);
 
-    uint8_t rk[32], ek[32], mk[32];
-    xor_mask_32(rk, g_rolling_key_masked);
-    xor_mask_32(ek, g_enc_key_masked);
-    xor_mask_32(mk, g_mac_key_masked);
+    uint8_t rk[32], ek[32], mk[32], gd[8];
+    xor_mask_buf(rk, g_rolling_key_masked, 32, esalt);
+    xor_mask_buf(ek, g_enc_key_masked, 32, esalt);
+    xor_mask_buf(mk, g_mac_key_masked, 32, esalt);
+    xor_mask_buf(gd, g_guard_masked, 8, esalt);
+    char guard_hex[17];
+    hex_encode(gd, 8, guard_hex);
 
+    // proof = HMAC(rk, sessionId|nextSeq|ts|hwid|jarHex|symHex|guardHex)
     char auth_msg[512];
-    int alen = snprintf(auth_msg, sizeof(auth_msg), "%s|%llu|%llu|%s|%s|%s",
-            g_session_id, (unsigned long long)next_seq, (unsigned long long)ts,
-            g_cached_hwid, g_cached_jar_hex, live_sym);
+    size_t ap = 0;
+    append_cstr(auth_msg, sizeof(auth_msg), ap, g_session_id); append_char(auth_msg, sizeof(auth_msg), ap, '|');
+    append_u64(auth_msg, sizeof(auth_msg), ap, next_seq);      append_char(auth_msg, sizeof(auth_msg), ap, '|');
+    append_u64(auth_msg, sizeof(auth_msg), ap, ts);            append_char(auth_msg, sizeof(auth_msg), ap, '|');
+    append_cstr(auth_msg, sizeof(auth_msg), ap, g_cached_hwid); append_char(auth_msg, sizeof(auth_msg), ap, '|');
+    append_cstr(auth_msg, sizeof(auth_msg), ap, g_cached_jar_hex); append_char(auth_msg, sizeof(auth_msg), ap, '|');
+    append_cstr(auth_msg, sizeof(auth_msg), ap, live_sym);     append_char(auth_msg, sizeof(auth_msg), ap, '|');
+    append_cstr(auth_msg, sizeof(auth_msg), ap, guard_hex);
     uint8_t proof[32];
-    hmac_sha256(rk, 32, (const uint8_t*)auth_msg, (size_t)alen, proof);
+    hmac_sha256(rk, 32, (const uint8_t*)auth_msg, ap, proof);
     char proof_hex[65];
     hex_encode(proof, 32, proof_hex);
+    secure_wipe(rk, sizeof(rk));
+    secure_wipe(proof, sizeof(proof));
 
-    SymBuf sjs, surl, sep;
-    char req_json[1024];
-    snprintf(req_json, sizeof(req_json),
-            "{\"%s\":\"%s\",\"seq\":%llu,\"ts\":%llu,\"hwid\":\"%s\",\"jarDigest\":\"%s\",\"symDigest\":\"%s\",\"proof\":\"%s\"}",
-            decrypt_sym(HY_SYM_J_SESS, sjs), g_session_id, (unsigned long long)next_seq, (unsigned long long)ts,
-            g_cached_hwid, g_cached_jar_hex, live_sym, proof_hex);
+    // Inner encrypted heartbeat payload: ts|hwid|jarHex|symHex|guardHex|proofHex
+    char inner_pt[512];
+    size_t ip = 0;
+    append_u64(inner_pt, sizeof(inner_pt), ip, ts);               append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_cstr(inner_pt, sizeof(inner_pt), ip, g_cached_hwid);   append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_cstr(inner_pt, sizeof(inner_pt), ip, g_cached_jar_hex); append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_cstr(inner_pt, sizeof(inner_pt), ip, live_sym);        append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_cstr(inner_pt, sizeof(inner_pt), ip, guard_hex);       append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_cstr(inner_pt, sizeof(inner_pt), ip, proof_hex);
 
+    uint8_t req_n12[12];
+    csprng(req_n12, 12);
+    uint8_t* req_ct = (uint8_t*)heap_alloc(ip);
+    chacha20_xor(ek, req_n12, 1u, (const uint8_t*)inner_pt, ip, req_ct);
+    secure_wipe(inner_pt, sizeof(inner_pt));
+
+    SymBuf shbq;
+    char req_aad[160];
+    size_t ra = 0;
+    append_cstr(req_aad, sizeof(req_aad), ra, decrypt_sym(HY_SYM_HBQ_PFX, shbq));
+    append_cstr(req_aad, sizeof(req_aad), ra, g_session_id);
+    append_char(req_aad, sizeof(req_aad), ra, '|');
+    append_u64(req_aad, sizeof(req_aad), ra, next_seq);
+
+    size_t rmac_in_len = ra + 12u + ip;
+    uint8_t* rmac_in = (uint8_t*)heap_alloc(rmac_in_len);
+    memcpy(rmac_in, req_aad, ra);
+    memcpy(rmac_in + ra, req_n12, 12);
+    memcpy(rmac_in + ra + 12u, req_ct, ip);
+    uint8_t req_mac[32];
+    hmac_sha256(mk, 32, rmac_in, rmac_in_len, req_mac);
+    heap_free(rmac_in);
+
+    char rn12_hex[25], rmac_hex[65];
+    char* rct_hex = (char*)heap_alloc(ip * 2u + 1u);
+    hex_encode(req_n12, 12, rn12_hex);
+    hex_encode(req_mac, 32, rmac_hex);
+    hex_encode(req_ct, ip, rct_hex);
+    heap_free(req_ct);
+
+    char req_json[2048];
+    size_t jp = 0;
+    append_char(req_json, sizeof(req_json), jp, '{');
+    append_json_str(req_json, sizeof(req_json), jp, 's', g_session_id, true);
+    append_json_u64(req_json, sizeof(req_json), jp, 'q', next_seq, true);
+    append_json_str(req_json, sizeof(req_json), jp, 'v', rn12_hex, true);
+    append_json_str(req_json, sizeof(req_json), jp, 'p', rct_hex, true);
+    append_json_str(req_json, sizeof(req_json), jp, 'm', rmac_hex, false);
+    append_char(req_json, sizeof(req_json), jp, '}');
+    heap_free(rct_hex);
+
+    SymBuf surl, sep;
     const char* url = decrypt_sym(HY_SYM_SRV_URL, surl);
     const char* ep = decrypt_sym(HY_SYM_EP_HB, sep);
     char resp[4096];
     int status = 0;
     bool http_ok = http_post_json(url, ep, req_json, resp, sizeof(resp), status);
-    secure_wipe(rk, sizeof(rk));
-    secure_wipe(proof, sizeof(proof));
 
     if (!http_ok) {
-        if (status == 401 || status == 403) {
-            g_session_revoked = 1;
-            poison_cookie();
-        }
+        secure_wipe(ek, sizeof(ek));
+        secure_wipe(mk, sizeof(mk));
+        secure_wipe(gd, sizeof(gd));
+        if (status >= 400 && status < 500) destroy_session_keys();
+        net_lock_release();
         return false;
     }
 
-    SymBuf sjn, sjc, sjm;
     char nonce_hex[32] = {}, ct_hex[2048] = {}, mac_hex[80] = {};
-    if (!json_get_str(resp, decrypt_sym(HY_SYM_J_NONCE, sjn), nonce_hex, sizeof(nonce_hex))
-            || !json_get_str(resp, decrypt_sym(HY_SYM_J_CT, sjc), ct_hex, sizeof(ct_hex))
-            || !json_get_str(resp, decrypt_sym(HY_SYM_J_MAC, sjm), mac_hex, sizeof(mac_hex))) {
-        g_session_revoked = 1; poison_cookie(); return false;
+    if (!json_get_key_str(resp, 'v', nonce_hex, sizeof(nonce_hex))
+            || !json_get_key_str(resp, 'p', ct_hex, sizeof(ct_hex))
+            || !json_get_key_str(resp, 'm', mac_hex, sizeof(mac_hex))) {
+        secure_wipe(ek, sizeof(ek)); secure_wipe(mk, sizeof(mk)); secure_wipe(gd, sizeof(gd));
+        destroy_session_keys();
+        net_lock_release();
+        return false;
     }
+
     uint8_t nonce12[12], mac[32];
     size_t ct_len = strlen(ct_hex) / 2u;
-    if (ct_len == 0 || ct_len > 1024u) { g_session_revoked = 1; poison_cookie(); return false; }
+    if (ct_len == 0u || ct_len > 1024u) {
+        secure_wipe(ek, sizeof(ek)); secure_wipe(mk, sizeof(mk)); secure_wipe(gd, sizeof(gd));
+        destroy_session_keys();
+        net_lock_release();
+        return false;
+    }
     uint8_t* ct = (uint8_t*)heap_alloc(ct_len);
-    uint8_t* pt = (uint8_t*)heap_alloc(ct_len + 1);
+    uint8_t* pt = (uint8_t*)heap_alloc(ct_len + 1u);
     if (!hex_decode(nonce_hex, strlen(nonce_hex), nonce12, 12)
             || !hex_decode(mac_hex, strlen(mac_hex), mac, 32)
             || !hex_decode(ct_hex, strlen(ct_hex), ct, ct_len)) {
-        heap_free(ct); heap_free(pt); g_session_revoked = 1; poison_cookie(); return false;
+        heap_free(ct); heap_free(pt);
+        secure_wipe(ek, sizeof(ek)); secure_wipe(mk, sizeof(mk)); secure_wipe(gd, sizeof(gd));
+        destroy_session_keys();
+        net_lock_release();
+        return false;
     }
 
+    SymBuf shb;
     char aad[160];
-    int aad_len = snprintf(aad, sizeof(aad), "HB|%s|%llu", g_session_id, (unsigned long long)next_seq);
-    size_t mac_in_len = (size_t)aad_len + 12u + ct_len;
+    size_t al = 0;
+    append_cstr(aad, sizeof(aad), al, decrypt_sym(HY_SYM_HB_PFX, shb));
+    append_cstr(aad, sizeof(aad), al, g_session_id);
+    append_char(aad, sizeof(aad), al, '|');
+    append_u64(aad, sizeof(aad), al, next_seq);
+
+    size_t mac_in_len = al + 12u + ct_len;
     uint8_t* mac_in = (uint8_t*)heap_alloc(mac_in_len);
-    memcpy(mac_in, aad, (size_t)aad_len);
-    memcpy(mac_in + aad_len, nonce12, 12);
-    memcpy(mac_in + aad_len + 12u, ct, ct_len);
-    uint8_t expected_mac[32];
-    hmac_sha256(mk, 32, mac_in, mac_in_len, expected_mac);
+    memcpy(mac_in, aad, al);
+    memcpy(mac_in + al, nonce12, 12);
+    memcpy(mac_in + al + 12u, ct, ct_len);
+    uint8_t exp_mac[32];
+    hmac_sha256(mk, 32, mac_in, mac_in_len, exp_mac);
     heap_free(mac_in);
 
-    bool mac_ok = ct_equal(expected_mac, mac, 32);
-    if (mac_ok) {
+    bool ok = ct_equal(exp_mac, mac, 32);
+    if (ok) {
         chacha20_xor(ek, nonce12, 1u, ct, ct_len, pt);
         pt[ct_len] = '\0';
-        // Format: seq|nextRollingHex64|hbSec|leaseSec|1
-        char* p1 = strchr((char*)pt, '|');
-        char* p2 = p1 ? strchr(p1 + 1, '|') : nullptr;
-        char* p3 = p2 ? strchr(p2 + 1, '|') : nullptr;
-        char* p4 = p3 ? strchr(p3 + 1, '|') : nullptr;
-        if (p1 && p2 && p3 && p4 && p4[1] == '1') {
-            uint8_t next_rk[32];
-            if (hex_decode(p1 + 1, (size_t)(p2 - (p1 + 1)), next_rk, 32)) {
-                xor_mask_32(g_rolling_key_masked, next_rk);
-                secure_wipe(next_rk, sizeof(next_rk));
-                uint32_t hb = (uint32_t)atoi(p2 + 1);
-                uint32_t lease = (uint32_t)atoi(p3 + 1);
-                if (hb > 0) g_hb_interval_sec = hb;
-                if (lease > 0) __atomic_store_n(&g_session_deadline_ms, monotonic_ms() + (uint64_t)lease * 1000ULL, __ATOMIC_RELEASE);
+        // Format: seq|epochHex64|hbSec|leaseSec|srvTimeSec|1
+        char* flds[6];
+        uint8_t epoch[32];
+        if (split_pipes((char*)pt, flds, 6)
+                && parse_u64_prefix(flds[0]) == next_seq
+                && flds[5][0] == '1'
+                && hex_decode(flds[1], strlen(flds[1]), epoch, 32)) {
+            uint64_t hb = parse_u64_prefix(flds[2]);
+            uint64_t lease = parse_u64_prefix(flds[3]);
+            uint64_t now_m = monotonic_ms();
+            uint64_t now_w = epoch_sec();
+            uint64_t wall_d = (now_w > g_sess_wall_anchor_s) ? (now_w - g_sess_wall_anchor_s) : 0ULL;
+            uint64_t mono_d = (now_m > g_sess_mono_anchor_ms) ? (now_m - g_sess_mono_anchor_ms) : 0ULL;
+            if (wall_d > (lease * 3ULL + 30ULL) && mono_d < (lease * 250ULL)) {
+                ok = false; // Clock freeze tamper detected
+            } else {
+                uint8_t nek[32], nmk[32], nrk[32], ngd[8];
+                derive_ratchet_keys(epoch, nek, nmk, nrk, ngd);
+                uint64_t new_esalt = splitmix64(esalt ^ hy_tick() ^ next_seq);
+                __atomic_store_n(&g_mem_epoch_salt, new_esalt, __ATOMIC_RELEASE);
+                xor_mask_buf(g_enc_key_masked, nek, 32, new_esalt);
+                xor_mask_buf(g_mac_key_masked, nmk, 32, new_esalt);
+                xor_mask_buf(g_rolling_key_masked, nrk, 32, new_esalt);
+                xor_mask_buf(g_guard_masked, ngd, 8, new_esalt);
+                secure_wipe(nek, sizeof(nek));
+                secure_wipe(nmk, sizeof(nmk));
+                secure_wipe(nrk, sizeof(nrk));
+                secure_wipe(ngd, sizeof(ngd));
+
+                uint32_t eff_hb = (uint32_t)(hb > 0 ? hb : 15ULL);
+                uint32_t eff_lease = (uint32_t)(lease > 0 ? lease : 45ULL);
+                g_hb_interval_sec = eff_hb;
+                g_lease_sec = eff_lease;
+                uint64_t c = (uint64_t)g_ptr_cookie;
+                __atomic_store_n(&g_hb_silence_limit_ms, ((uint64_t)eff_lease + (uint64_t)eff_hb + 3ULL) * 1000ULL, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_hb_pulse_masked, now_m ^ c, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_sess_deadline_masked, (now_m + (uint64_t)eff_lease * 1000ULL) ^ c, __ATOMIC_RELEASE);
+                g_sess_wall_anchor_s = now_w;
+                g_sess_mono_anchor_ms = now_m;
                 g_session_seq = next_seq;
-                secure_wipe(ek, sizeof(ek)); secure_wipe(mk, sizeof(mk));
-                secure_wipe(pt, ct_len); heap_free(ct); heap_free(pt);
-                return true;
             }
+            secure_wipe(epoch, sizeof(epoch));
+        } else {
+            ok = false;
         }
     }
-    secure_wipe(ek, sizeof(ek)); secure_wipe(mk, sizeof(mk));
-    secure_wipe(pt, ct_len); heap_free(ct); heap_free(pt);
-    g_session_revoked = 1;
-    poison_cookie();
-    return false;
+
+    secure_wipe(ek, sizeof(ek));
+    secure_wipe(mk, sizeof(mk));
+    secure_wipe(gd, sizeof(gd));
+    secure_wipe(pt, ct_len);
+    heap_free(ct);
+    heap_free(pt);
+    if (!ok) destroy_session_keys();
+    net_lock_release();
+    return ok;
 }
 
 #ifdef _WIN32
 static DWORD WINAPI hb_thread_proc(void*) {
     hide_current_thread();
-    while (!g_tampered && !g_session_revoked) {
+    while (!g_tampered && !__atomic_load_n(&g_hb_stop, __ATOMIC_ACQUIRE) && __atomic_load_n(&g_sess_state_masked, __ATOMIC_ACQUIRE) != 0ULL) {
         uint32_t iv = g_hb_interval_sec;
         if (iv < 1u) iv = 1u;
         Sleep(iv * 1000u);
-        if (g_tampered || g_session_revoked) break;
-        if (!send_heartbeat_once() && monotonic_ms() > __atomic_load_n(&g_session_deadline_ms, __ATOMIC_ACQUIRE)) {
-            g_session_revoked = 1;
-            poison_cookie();
+        if (g_tampered || __atomic_load_n(&g_hb_stop, __ATOMIC_ACQUIRE)) break;
+        run_periodic_vm_guard();
+        if (g_tampered) { destroy_session_keys(); break; }
+        if (!send_heartbeat_once() && !verify_session_window()) {
+            destroy_session_keys();
             break;
         }
     }
@@ -550,14 +832,15 @@ static DWORD WINAPI hb_thread_proc(void*) {
 #else
 static void* hb_thread_proc(void*) {
     hide_current_thread();
-    while (!g_tampered && !g_session_revoked) {
+    while (!g_tampered && !__atomic_load_n(&g_hb_stop, __ATOMIC_ACQUIRE) && __atomic_load_n(&g_sess_state_masked, __ATOMIC_ACQUIRE) != 0ULL) {
         uint32_t iv = g_hb_interval_sec;
         if (iv < 1u) iv = 1u;
         sleep(iv);
-        if (g_tampered || g_session_revoked) break;
-        if (!send_heartbeat_once() && monotonic_ms() > __atomic_load_n(&g_session_deadline_ms, __ATOMIC_ACQUIRE)) {
-            g_session_revoked = 1;
-            poison_cookie();
+        if (g_tampered || __atomic_load_n(&g_hb_stop, __ATOMIC_ACQUIRE)) break;
+        run_periodic_vm_guard();
+        if (g_tampered) { destroy_session_keys(); break; }
+        if (!send_heartbeat_once() && !verify_session_window()) {
+            destroy_session_keys();
             break;
         }
     }
@@ -565,18 +848,95 @@ static void* hb_thread_proc(void*) {
 }
 #endif
 
+void server_logout() {
+    net_lock_acquire();
+    __atomic_store_n(&g_hb_stop, 1, __ATOMIC_RELEASE);
+    if (g_session_id[0] != '\0' && __atomic_load_n(&g_sess_state_masked, __ATOMIC_ACQUIRE) != 0ULL) {
+        uint64_t esalt = __atomic_load_n(&g_mem_epoch_salt, __ATOMIC_ACQUIRE);
+        uint64_t ts = epoch_sec();
+        uint8_t rk[32], ek[32], mk[32], gd[8];
+        xor_mask_buf(rk, g_rolling_key_masked, 32, esalt);
+        xor_mask_buf(ek, g_enc_key_masked, 32, esalt);
+        xor_mask_buf(mk, g_mac_key_masked, 32, esalt);
+        xor_mask_buf(gd, g_guard_masked, 8, esalt);
+        char guard_hex[17];
+        hex_encode(gd, 8, guard_hex);
+
+        SymBuf slo, sloq, surl, sep;
+        char msg[192];
+        size_t mp = 0;
+        append_cstr(msg, sizeof(msg), mp, decrypt_sym(HY_SYM_LO_PFX, slo));
+        append_cstr(msg, sizeof(msg), mp, g_session_id);
+        append_char(msg, sizeof(msg), mp, '|');
+        append_u64(msg, sizeof(msg), mp, ts);
+        uint8_t proof[32];
+        hmac_sha256(rk, 32, (const uint8_t*)msg, mp, proof);
+        char proof_hex[65];
+        hex_encode(proof, 32, proof_hex);
+
+        char pt[256];
+        size_t pp = 0;
+        append_u64(pt, sizeof(pt), pp, ts); append_char(pt, sizeof(pt), pp, '|');
+        append_cstr(pt, sizeof(pt), pp, guard_hex); append_char(pt, sizeof(pt), pp, '|');
+        append_cstr(pt, sizeof(pt), pp, proof_hex);
+
+        uint8_t n12[12];
+        csprng(n12, 12);
+        uint8_t* ct = (uint8_t*)heap_alloc(pp);
+        chacha20_xor(ek, n12, 1u, (const uint8_t*)pt, pp, ct);
+
+        char aad[160];
+        size_t ap = 0;
+        append_cstr(aad, sizeof(aad), ap, decrypt_sym(HY_SYM_LOQ_PFX, sloq));
+        append_cstr(aad, sizeof(aad), ap, g_session_id);
+
+        size_t min_len = ap + 12u + pp;
+        uint8_t* mac_in = (uint8_t*)heap_alloc(min_len);
+        memcpy(mac_in, aad, ap);
+        memcpy(mac_in + ap, n12, 12);
+        memcpy(mac_in + ap + 12u, ct, pp);
+        uint8_t mac[32];
+        hmac_sha256(mk, 32, mac_in, min_len, mac);
+        heap_free(mac_in);
+
+        char n12_hex[25], mac_hex[65];
+        char* ct_hex = (char*)heap_alloc(pp * 2u + 1u);
+        hex_encode(n12, 12, n12_hex);
+        hex_encode(mac, 32, mac_hex);
+        hex_encode(ct, pp, ct_hex);
+        heap_free(ct);
+
+        char req_json[1024];
+        size_t jp = 0;
+        append_char(req_json, sizeof(req_json), jp, '{');
+        append_json_str(req_json, sizeof(req_json), jp, 's', g_session_id, true);
+        append_json_str(req_json, sizeof(req_json), jp, 'v', n12_hex, true);
+        append_json_str(req_json, sizeof(req_json), jp, 'p', ct_hex, true);
+        append_json_str(req_json, sizeof(req_json), jp, 'm', mac_hex, false);
+        append_char(req_json, sizeof(req_json), jp, '}');
+        heap_free(ct_hex);
+
+        char resp[512];
+        int st = 0;
+        http_post_json(decrypt_sym(HY_SYM_SRV_URL, surl), decrypt_sym(HY_SYM_EP_LO, sep), req_json, resp, sizeof(resp), st);
+
+        secure_wipe(rk, sizeof(rk));
+        secure_wipe(ek, sizeof(ek));
+        secure_wipe(mk, sizeof(mk));
+        secure_wipe(gd, sizeof(gd));
+    }
+    destroy_session_keys();
+    net_lock_release();
+}
+
 bool server_handshake(JNIEnv* env, uint64_t jar_digest, uint64_t* out_vm_share, uint64_t* out_vault_share) {
     *out_vm_share = 0;
     *out_vault_share = 0;
 
     compute_hwid(g_cached_hwid);
-    snprintf(g_cached_jar_hex, sizeof(g_cached_jar_hex), "%016llx", (unsigned long long)jar_digest);
-
-    const uint64_t _op = opaque_seed();
-    uint64_t sh = HY_MBA_HASH_BASIS(_op);
-    uint64_t hp = HY_MBA_HASH_PRIME(_op);
-    for (uint32_t i = 0; i < g_sym_blob_size; i++) { sh ^= g_sym_blob[i]; sh *= hp; }
-    snprintf(g_cached_sym_hex, sizeof(g_cached_sym_hex), "%016llx", (unsigned long long)sh);
+    u64_to_hex16(jar_digest, g_cached_jar_hex);
+    char sym_hex[17];
+    u64_to_hex16(live_sym_digest(), sym_hex);
 
     char lic_key[256] = {};
     resolve_license_key(env, lic_key, sizeof(lic_key));
@@ -589,64 +949,101 @@ bool server_handshake(JNIEnv* env, uint64_t jar_digest, uint64_t* out_vm_share, 
     x25519_public(c_pub, c_priv);
     csprng(c_nonce, 16);
 
+    const uint64_t _op = opaque_seed();
     uint8_t srv_static_pub[32];
     for (int i = 0; i < 32; i++) {
         srv_static_pub[i] = g_srv_pubkey_masked[i] ^ (uint8_t)((splitmix64(HY_MBA_PUBKEY_MASK(_op) + (uint64_t)i * 0x9E3779B97F4A7C15ULL) >> ((i & 7) * 8)) & 0xFFu);
     }
-
     uint8_t dh_static[32];
     x25519(dh_static, c_priv, srv_static_pub);
     secure_wipe(srv_static_pub, sizeof(srv_static_pub));
 
-    SymBuf spro, sbld, surl, shsp, sep;
+    SymBuf spro, sbld, surl, sre2, srm2, sep;
     const char* product_id = decrypt_sym(HY_SYM_PRODUCT_ID, spro);
     const char* build_id = decrypt_sym(HY_SYM_BUILD_ID, sbld);
     const char* url = decrypt_sym(HY_SYM_SRV_URL, surl);
+    const char* req_e2 = decrypt_sym(HY_SYM_REQ_E2, sre2);
+    const char* req_m2 = decrypt_sym(HY_SYM_REQ_M2, srm2);
 
-    char hs_info[128];
-    int hilen = snprintf(hs_info, sizeof(hs_info), "%s%s", decrypt_sym(HY_SYM_HS_PFX, shsp), build_id);
-    uint8_t hs_auth_key[32];
-    hkdf_sha256(c_nonce, 16, dh_static, 32, (const uint8_t*)hs_info, (size_t)hilen, hs_auth_key, 32);
+    uint8_t req_enc_k[32], req_mac_k[32];
+    hkdf_sha256(c_nonce, 16, dh_static, 32, (const uint8_t*)req_e2, strlen(req_e2), req_enc_k, 32);
+    hkdf_sha256(c_nonce, 16, dh_static, 32, (const uint8_t*)req_m2, strlen(req_m2), req_mac_k, 32);
 
     char cpub_hex[65], cnonce_hex[33];
     hex_encode(c_pub, 32, cpub_hex);
     hex_encode(c_nonce, 16, cnonce_hex);
     uint64_t ts = epoch_sec();
 
-    char auth_msg[768];
-    int amlen = snprintf(auth_msg, sizeof(auth_msg), "%s|%s|%s|%s|%s|%s|%llu|%s",
-            product_id, build_id, lic_key, g_cached_hwid, g_cached_jar_hex, g_cached_sym_hex,
-            (unsigned long long)ts, cpub_hex);
-    uint8_t proof[32];
-    hmac_sha256(hs_auth_key, 32, (const uint8_t*)auth_msg, (size_t)amlen, proof);
-    char proof_hex[65];
-    hex_encode(proof, 32, proof_hex);
-    secure_wipe(hs_auth_key, sizeof(hs_auth_key));
-
-    char req_json[1280];
-    snprintf(req_json, sizeof(req_json),
-            "{\"productId\":\"%s\",\"buildId\":\"%s\",\"licenseKey\":\"%s\",\"hwid\":\"%s\","
-            "\"jarDigest\":\"%s\",\"symDigest\":\"%s\",\"clientPub\":\"%s\",\"clientNonce\":\"%s\",\"ts\":%llu,\"proof\":\"%s\"}",
-            product_id, build_id, lic_key, g_cached_hwid, g_cached_jar_hex, g_cached_sym_hex,
-            cpub_hex, cnonce_hex, (unsigned long long)ts, proof_hex);
+    // Encrypted inner handshake payload: productId|buildId|licKey|hwid|jarHex|symHex|ts|cpubHex
+    char inner_pt[1024];
+    size_t ip = 0;
+    append_cstr(inner_pt, sizeof(inner_pt), ip, product_id);       append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_cstr(inner_pt, sizeof(inner_pt), ip, build_id);         append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_cstr(inner_pt, sizeof(inner_pt), ip, lic_key);          append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_cstr(inner_pt, sizeof(inner_pt), ip, g_cached_hwid);    append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_cstr(inner_pt, sizeof(inner_pt), ip, g_cached_jar_hex); append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_cstr(inner_pt, sizeof(inner_pt), ip, sym_hex);          append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_u64(inner_pt, sizeof(inner_pt), ip, ts);                append_char(inner_pt, sizeof(inner_pt), ip, '|');
+    append_cstr(inner_pt, sizeof(inner_pt), ip, cpub_hex);
     secure_wipe(lic_key, sizeof(lic_key));
+
+    uint8_t req_n12[12];
+    csprng(req_n12, 12);
+    uint8_t* req_ct = (uint8_t*)heap_alloc(ip);
+    chacha20_xor(req_enc_k, req_n12, 1u, (const uint8_t*)inner_pt, ip, req_ct);
+    secure_wipe(inner_pt, sizeof(inner_pt));
+    secure_wipe(req_enc_k, sizeof(req_enc_k));
+
+    char req_aad[128];
+    size_t rap = 0;
+    append_cstr(req_aad, sizeof(req_aad), rap, cpub_hex);
+    append_char(req_aad, sizeof(req_aad), rap, '|');
+    append_cstr(req_aad, sizeof(req_aad), rap, cnonce_hex);
+    size_t rmac_len = rap + 12u + ip;
+    uint8_t* rmac_in = (uint8_t*)heap_alloc(rmac_len);
+    memcpy(rmac_in, req_aad, rap);
+    memcpy(rmac_in + rap, req_n12, 12);
+    memcpy(rmac_in + rap + 12u, req_ct, ip);
+    uint8_t req_mac[32];
+    hmac_sha256(req_mac_k, 32, rmac_in, rmac_len, req_mac);
+    heap_free(rmac_in);
+    secure_wipe(req_mac_k, sizeof(req_mac_k));
+
+    char rn12_hex[25], rmac_hex[65];
+    char* rct_hex = (char*)heap_alloc(ip * 2u + 1u);
+    hex_encode(req_n12, 12, rn12_hex);
+    hex_encode(req_mac, 32, rmac_hex);
+    hex_encode(req_ct, ip, rct_hex);
+    heap_free(req_ct);
+
+    char* req_json = (char*)heap_alloc(ip * 2u + 512u);
+    size_t jp = 0;
+    append_char(req_json, ip * 2u + 512u, jp, '{');
+    append_json_str(req_json, ip * 2u + 512u, jp, 'k', cpub_hex, true);
+    append_json_str(req_json, ip * 2u + 512u, jp, 'n', cnonce_hex, true);
+    append_json_str(req_json, ip * 2u + 512u, jp, 'v', rn12_hex, true);
+    append_json_str(req_json, ip * 2u + 512u, jp, 'p', rct_hex, true);
+    append_json_str(req_json, ip * 2u + 512u, jp, 'm', rmac_hex, false);
+    append_char(req_json, ip * 2u + 512u, jp, '}');
+    heap_free(rct_hex);
 
     char resp[8192];
     int status = 0;
-    if (!http_post_json(url, decrypt_sym(HY_SYM_EP_HS, sep), req_json, resp, sizeof(resp), status)) {
+    bool http_ok = http_post_json(url, decrypt_sym(HY_SYM_EP_HS, sep), req_json, resp, sizeof(resp), status);
+    heap_free(req_json);
+    if (!http_ok) {
         secure_wipe(c_priv, sizeof(c_priv));
         secure_wipe(dh_static, sizeof(dh_static));
         return false;
     }
 
-    SymBuf sj_sess, sj_seph, sj_snonce, sj_nonce, sj_ct, sj_mac;
     char sess_id[72] = {}, seph_hex[80] = {}, snonce_hex[40] = {}, nonce_hex[32] = {}, ct_hex[4096] = {}, mac_hex[80] = {};
-    if (!json_get_str(resp, decrypt_sym(HY_SYM_J_SESS, sj_sess), sess_id, sizeof(sess_id))
-            || !json_get_str(resp, decrypt_sym(HY_SYM_J_SEPH, sj_seph), seph_hex, sizeof(seph_hex))
-            || !json_get_str(resp, decrypt_sym(HY_SYM_J_SNONCE, sj_snonce), snonce_hex, sizeof(snonce_hex))
-            || !json_get_str(resp, decrypt_sym(HY_SYM_J_NONCE, sj_nonce), nonce_hex, sizeof(nonce_hex))
-            || !json_get_str(resp, decrypt_sym(HY_SYM_J_CT, sj_ct), ct_hex, sizeof(ct_hex))
-            || !json_get_str(resp, decrypt_sym(HY_SYM_J_MAC, sj_mac), mac_hex, sizeof(mac_hex))) {
+    if (!json_get_key_str(resp, 's', sess_id, sizeof(sess_id))
+            || !json_get_key_str(resp, 'k', seph_hex, sizeof(seph_hex))
+            || !json_get_key_str(resp, 'n', snonce_hex, sizeof(snonce_hex))
+            || !json_get_key_str(resp, 'v', nonce_hex, sizeof(nonce_hex))
+            || !json_get_key_str(resp, 'p', ct_hex, sizeof(ct_hex))
+            || !json_get_key_str(resp, 'm', mac_hex, sizeof(mac_hex))) {
         secure_wipe(c_priv, sizeof(c_priv));
         secure_wipe(dh_static, sizeof(dh_static));
         return false;
@@ -665,7 +1062,7 @@ bool server_handshake(JNIEnv* env, uint64_t jar_digest, uint64_t* out_vm_share, 
     }
 
     uint8_t* ct = (uint8_t*)heap_alloc(ct_len);
-    uint8_t* pt = (uint8_t*)heap_alloc(ct_len + 1);
+    uint8_t* pt = (uint8_t*)heap_alloc(ct_len + 1u);
     if (!hex_decode(ct_hex, strlen(ct_hex), ct, ct_len)) {
         heap_free(ct); heap_free(pt);
         secure_wipe(c_priv, sizeof(c_priv));
@@ -687,21 +1084,33 @@ bool server_handshake(JNIEnv* env, uint64_t jar_digest, uint64_t* out_vm_share, 
 
     SymBuf ssp;
     char sess_info[256];
-    int silen = snprintf(sess_info, sizeof(sess_info), "%s%s|%s", decrypt_sym(HY_SYM_SESS_PFX, ssp), build_id, g_cached_hwid);
+    size_t sip = 0;
+    append_cstr(sess_info, sizeof(sess_info), sip, decrypt_sym(HY_SYM_SESS_PFX, ssp));
+    append_cstr(sess_info, sizeof(sess_info), sip, build_id);
+    append_char(sess_info, sizeof(sess_info), sip, '|');
+    append_cstr(sess_info, sizeof(sess_info), sip, g_cached_hwid);
+
     uint8_t master_key[32], enc_key[32], mac_key[32];
-    hkdf_sha256(salt, 32, ikm, 64, (const uint8_t*)sess_info, (size_t)silen, master_key, 32);
-    hkdf_expand(master_key, (const uint8_t*)"ENC", 3, enc_key, 32);
-    hkdf_expand(master_key, (const uint8_t*)"MAC", 3, mac_key, 32);
+    hkdf_sha256(salt, 32, ikm, 64, (const uint8_t*)sess_info, sip, master_key, 32);
+    uint8_t le = 'E', lm = 'M';
+    hkdf_expand(master_key, &le, 1, enc_key, 32);
+    hkdf_expand(master_key, &lm, 1, mac_key, 32);
     secure_wipe(ikm, sizeof(ikm));
     secure_wipe(master_key, sizeof(master_key));
 
     char aad[512];
-    int aad_len = snprintf(aad, sizeof(aad), "%s|%s|%s|%s|%s", sess_id, build_id, g_cached_hwid, cpub_hex, seph_hex);
-    size_t mac_in_len = (size_t)aad_len + 12u + ct_len;
+    size_t aap = 0;
+    append_cstr(aad, sizeof(aad), aap, sess_id);        append_char(aad, sizeof(aad), aap, '|');
+    append_cstr(aad, sizeof(aad), aap, build_id);       append_char(aad, sizeof(aad), aap, '|');
+    append_cstr(aad, sizeof(aad), aap, g_cached_hwid);  append_char(aad, sizeof(aad), aap, '|');
+    append_cstr(aad, sizeof(aad), aap, cpub_hex);       append_char(aad, sizeof(aad), aap, '|');
+    append_cstr(aad, sizeof(aad), aap, seph_hex);
+
+    size_t mac_in_len = aap + 12u + ct_len;
     uint8_t* mac_in = (uint8_t*)heap_alloc(mac_in_len);
-    memcpy(mac_in, aad, (size_t)aad_len);
-    memcpy(mac_in + aad_len, nonce12, 12);
-    memcpy(mac_in + aad_len + 12u, ct, ct_len);
+    memcpy(mac_in, aad, aap);
+    memcpy(mac_in + aap, nonce12, 12);
+    memcpy(mac_in + aap + 12u, ct, ct_len);
     uint8_t exp_mac[32];
     hmac_sha256(mac_key, 32, mac_in, mac_in_len, exp_mac);
     heap_free(mac_in);
@@ -710,18 +1119,14 @@ bool server_handshake(JNIEnv* env, uint64_t jar_digest, uint64_t* out_vm_share, 
     if (ok) {
         chacha20_xor(enc_key, nonce12, 1u, ct, ct_len, pt);
         pt[ct_len] = '\0';
-        // Format: vmShareHex|vaultShareHex|rollingHex64|hbSec|leaseSec|dynParamsHex
-        char* p1 = strchr((char*)pt, '|');
-        char* p2 = p1 ? strchr(p1 + 1, '|') : nullptr;
-        char* p3 = p2 ? strchr(p2 + 1, '|') : nullptr;
-        char* p4 = p3 ? strchr(p3 + 1, '|') : nullptr;
-        char* p5 = p4 ? strchr(p4 + 1, '|') : nullptr;
-        if (p1 && p2 && p3 && p4 && p5) {
-            *p1 = *p2 = *p3 = *p4 = *p5 = '\0';
-            uint8_t vm_b[8], vs_b[8], rk[32];
-            if (hex_decode((const char*)pt, strlen((const char*)pt), vm_b, 8)
-                    && hex_decode(p1 + 1, strlen(p1 + 1), vs_b, 8)
-                    && hex_decode(p2 + 1, strlen(p2 + 1), rk, 32)) {
+        // Format: vmShareHex|vaultShareHex|rollingHex64|hbSec|leaseSec|srvTimeSec|guardHex16|dynParamsHex
+        char* flds[8];
+        if (split_pipes((char*)pt, flds, 8)) {
+            uint8_t vm_b[8], vs_b[8], rk[32], gd[8];
+            if (hex_decode(flds[0], strlen(flds[0]), vm_b, 8)
+                    && hex_decode(flds[1], strlen(flds[1]), vs_b, 8)
+                    && hex_decode(flds[2], strlen(flds[2]), rk, 32)
+                    && hex_decode(flds[6], strlen(flds[6]), gd, 8)) {
                 uint64_t vm_u = 0, vs_u = 0;
                 for (int b = 0; b < 8; b++) {
                     vm_u = (vm_u << 8) | vm_b[b];
@@ -730,7 +1135,7 @@ bool server_handshake(JNIEnv* env, uint64_t jar_digest, uint64_t* out_vm_share, 
                 *out_vm_share = vm_u;
                 *out_vault_share = vs_u;
 
-                const char* dp = p5 + 1;
+                const char* dp = flds[7];
                 size_t dplen = strlen(dp);
                 for (int d = 0; d < 8 && (size_t)(d * 16 + 16) <= dplen; d++) {
                     uint8_t db[8];
@@ -741,19 +1146,33 @@ bool server_handshake(JNIEnv* env, uint64_t jar_digest, uint64_t* out_vm_share, 
                     }
                 }
 
-                snprintf(g_session_id, sizeof(g_session_id), "%s", sess_id);
-                xor_mask_32(g_enc_key_masked, enc_key);
-                xor_mask_32(g_mac_key_masked, mac_key);
-                xor_mask_32(g_rolling_key_masked, rk);
+                size_t sidp = 0;
+                append_cstr(g_session_id, sizeof(g_session_id), sidp, sess_id);
+                uint64_t init_esalt = splitmix64(hy_tick() ^ _op ^ vm_u);
+                __atomic_store_n(&g_mem_epoch_salt, init_esalt, __ATOMIC_RELEASE);
+                xor_mask_buf(g_enc_key_masked, enc_key, 32, init_esalt);
+                xor_mask_buf(g_mac_key_masked, mac_key, 32, init_esalt);
+                xor_mask_buf(g_rolling_key_masked, rk, 32, init_esalt);
+                xor_mask_buf(g_guard_masked, gd, 8, init_esalt);
                 secure_wipe(rk, sizeof(rk));
+                secure_wipe(gd, sizeof(gd));
 
-                uint32_t hb = (uint32_t)atoi(p3 + 1);
-                uint32_t lease = (uint32_t)atoi(p4 + 1);
-                g_hb_interval_sec = hb > 0 ? hb : 15u;
-                uint64_t dl = monotonic_ms() + (uint64_t)(lease > 0 ? lease : 45u) * 1000ULL;
-                __atomic_store_n(&g_session_deadline_ms, dl, __ATOMIC_RELEASE);
+                uint32_t hb = (uint32_t)parse_u64_prefix(flds[3]);
+                uint32_t lease = (uint32_t)parse_u64_prefix(flds[4]);
+                g_hb_interval_sec = hb > 0u ? hb : 15u;
+                g_lease_sec = lease > 0u ? lease : 45u;
+
+                uint64_t now_m = monotonic_ms();
+                uint64_t now_w = epoch_sec();
+                uint64_t c = (uint64_t)g_ptr_cookie;
+                g_sess_wall_anchor_s = now_w;
+                g_sess_mono_anchor_ms = now_m;
+                __atomic_store_n(&g_hb_silence_limit_ms, ((uint64_t)g_lease_sec + (uint64_t)g_hb_interval_sec + 3ULL) * 1000ULL, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_hb_pulse_masked, now_m ^ c, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_sess_deadline_masked, (now_m + (uint64_t)g_lease_sec * 1000ULL) ^ c, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_sess_state_masked, HY_MBA_SESS_ALIVE_MAGIC(_op) ^ c, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_hb_stop, 0, __ATOMIC_RELEASE);
                 g_session_seq = 0;
-                g_session_established = 1;
 
 #ifdef _WIN32
                 HANDLE hThr = CreateThread(nullptr, 0, hb_thread_proc, nullptr, 0, nullptr);

@@ -24,20 +24,22 @@
 - `hydro_crypto.cpp` — **X25519**, **ChaCha20**, **HMAC-SHA256**, **HKDF-SHA256**, CSPRNG (`BCryptGenRandom` через динамический экспорт без статического импорта / `/dev/urandom`).
 - `hydro_security.cpp` — анти-отладка и анти-тампер:
   - Обход PEB + хэш-резолвинг WinAPI (`FNV-1a`) с поддержкой PE export forwarders — минимальная таблица импортов без строк API в `.rdata`.
-  - Детект отладчиков и инструментов анализа (`PEB`, `NtQueryInformationProcess`, аппаратные `Dr0..Dr3`, `TracerPid`, `sysctl`, поиск модулей `frida-agent.dll`, `frida-gadget.dll`, `x64dbg.dll`, `scyllahide.dll`, `vehdebug-x86_64.dll`).
+  - Детект отладчиков и инструментов анализа на старте и периодически в рантайме (`PEB`, `NtQueryInformationProcess`, аппаратные `Dr0..Dr3`, `TracerPid`, `sysctl`, поиск `frida-*`, `x64dbg.dll`, `scyllahide.dll`, `vehdebug-*`, `cheatengine-*`, `titanengine.dll`, `sharpod.dll`, `minhook.x64.dll`).
   - Скрытие рабочего heartbeat-потока от отладчика (`NtSetInformationThread` / `ThreadHideFromDebugger`).
-  - Самопроверка целостности секции `.text` (`VirtualQuery` + хэш секции кода), детектор inline-хуков (`0xCC`/`0xE9`/`JMP`/`BRK`) и проверка печати таблицы символов `g_hydro_seal_box`.
-- `hydro_net.cpp` — клиентский протокол лицензирования и rolling heartbeat (полностью исключается из сборки при отключённом `--server-url`, а при включённом использует динамическую загрузку `winhttp.dll`/`advapi32.dll` и зашифрованные строки).
-- `hydro_jni_bridge.cpp` — единый экспорт `JNI_OnLoad`, динамическая регистрация методов через `RegisterNatives`, верификация JAR/ресурсов и загрузка `.fucked` через `DefineClass`.
-- `hydro_vm_core.cpp` — стековая нативная ВМ с шифрованным байткодом, периодическим guard-чеком и проверкой активной сессии.
-- `NativeCompiler` — автоматическое зануление временных меток PE (`COFF TimeDateStamp`, `ExportDirectory`, `DebugDirectory`).
+  - Самопроверка всех секций кода `IMAGE_SCN_CNT_CODE` (`VirtualQuery`), детектор inline-хуков (`0xCC`/`0xE9`/`JMP`/`BRK`) и проверка печати таблицы символов `g_hydro_seal_box`.
+- `hydro_net.cpp` — клиентский E2EE протокол v2 (без `<stdio.h>` и без открытых JSON/HTTP-ключей):
+  - Полностью исключается из сборки при отключённом `--server-url`, а при включённом использует динамическую загрузку `winhttp.dll`/`advapi32.dll`, `CreateFileA` через PEB и шифрованный пул.
+  - Инлайн-guard сессии (`inline_session_ok` + `HY_MBA_SESS_ALIVE_MAGIC`), watchdog прогресса heartbeat-потока, защита от заморозки таймеров и `destroy_session_keys()` со стиранием ключей при отзыве.
+- `hydro_jni_bridge.cpp` — единый экспорт `JNI_OnLoad` (+ `JNI_OnUnload` logout при серверной привязке), динамическая регистрация методов через `RegisterNatives`, верификация JAR/ресурсов и загрузка `.fucked` через `DefineClass`.
+- `hydro_vm_core.cpp` — стековая нативная ВМ с шифрованным байткодом, разреженным биективным диспетчером и инлайн-проверкой сессии.
+- `JavaPreHardener` / `ConstructorOutliner` / `ClassRewriter` — вынос `<init>`/`<clinit>` в нативку, шифрование остаточных строковых и числовых констант в оставшихся `.class` (включая интерфейсы и `HLoader`), SplitMix64 для `--encrypt-dll` и зануление временных меток PE (`COFF TimeDateStamp`, `ExportDirectory`, `DebugDirectory`).
 
 ### 3. Spring Boot сервер лицензий и динамических сессий (`server/`)
-Сервер (`Java 21`, `Spring Boot 3.5.0`, `Spring Data JPA`, `H2`) привязывает нативный код к активной онлайн-сессии так, что без валидной лицензии клиент не может расшифровать ключи VM и vault:
-- **Split-secret архитектура:** во время сборки `HydroJ2C` отделяет `serverVmShare` и `serverVaultShare` в манифест `<output>-server.json` (или сразу регистрирует на сервере через `--server-admin-token`). В клиентский JAR/DLL эти доли не попадают.
-- **Сквозная криптография:** взаимный **X25519** (статический ключ сервера + эфемерные ключи), деривация через **HKDF-SHA256**, шифрование ответа **ChaCha20** и аутентификация **HMAC-SHA256**.
-- **HWID-привязка и Rolling Heartbeat:** вычисление аппаратного ID нативного уровня, периодическая ротация `rollingKey` на каждом heartbeat, автоматический отзыв сессии по таймауту lease.
-- **Мгновенный live-бан:** отзыв лицензии или билда админ-запросом мгновенно обрывает активные клиенты на следующем heartbeat / проверке VM.
+Сервер (`Java 21`, `Spring Boot 3.5.0`, `Spring Data JPA`, `H2`) намертво привязывает нативный код к активной онлайн-сессии так, что без валидной лицензии клиент не может запустить даже отдельные методы:
+- **Split-secret + CFF/VM Server State Coupling:** во время сборки `HydroJ2C` отделяет `serverVmShare`, `serverVaultShare` и массив `dynParams[8]` в манифест `<output>-server.json` (или сразу на сервер через `--server-admin-token`). В клиентский JAR/DLL эти секреты не попадают; ими защищены `.fucked`-классы, ключ Native VM и начальное состояние CFF-автомата в каждом скомпилированном методе.
+- **Протокол E2EE v2 поверх всего трафика:** **все** запросы и ответы (`/handshake`, `/heartbeat`, `/logout`) передаются в зашифрованных ChaCha20 + HMAC-SHA256 конвертах поверх X25519 + HKDF-SHA256 без открытых полей `licenseKey`/`hwid`/`jarDigest`/`sessionId` в HTTP-запросах.
+- **Full Key Ratcheting & Anti-Replay:** сервер ведёт кэш повторов handshake (`(k, n)`), привязывает сессию к HWID и `sessionGuard`, и на каждом heartbeat вращает **все** ключи (`encKey`, `macKey`, `rollingKey`, `guard`) через HMAC-epoch ratchet.
+- **Мгновенный live-бан:** отзыв лицензии/билда админ-запросом, истечение lease или остановка heartbeat-потока немедленно уничтожают ключи в памяти активного клиента.
 
 ---
 

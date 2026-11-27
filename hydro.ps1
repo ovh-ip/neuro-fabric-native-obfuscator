@@ -125,8 +125,9 @@ switch ($Action.ToLower()) {
             "SecretLogic", "ClientMixin", "FakeMinecraftClient", "integerAndFloatEdgeCases",
             "HY2026", "onClientTick", "HYDROSEA", "AESORDYH", "xrunjdwp", "jdwp",
             "winhttp.dll", "advapi32.dll", "bcrypt.dll", "BCryptGenRandom",
-            "WinHttpOpen", "RegOpenKeyExA", "/api/v1/session", "HY-HS-AUTH",
-            "HY-SESS-V1", "HY-HWID-V1", "sessionId", "srvEphPub", "serverNonce", "HydroAgent/1.0"
+            "WinHttpOpen", "RegOpenKeyExA", "CreateFileA", "/api/v1/session", "HY-HS-AUTH",
+            "HY-REQ-E2", "HY-SESS-V1", "HY-SESS-V2", "HY-HWID-V1", "sessionId", "srvEphPub",
+            "serverNonce", "HydroAgent/1.0"
         )) {
             if ($dllText.Contains($leak)) { throw "SECURITY LEAK: Found plaintext '$leak' inside DLL!" }
         }
@@ -238,9 +239,30 @@ switch ($Action.ToLower()) {
 
         $ProtAppUltraJar = Join-Path $Root "build\test-app-ultra.jar"
         $ProtAppUltraDll = Join-Path $Root "build\test-app-ultra.dll"
-        Write-Host "`n=== Protecting Standard Runnable JAR (ULTRA + Native VM tier) ==="
-        & $Java -cp $cp dev.hydro.j2c.Main -i $AppJar -o $ProtAppUltraJar -d $ProtAppUltraDll --tier ULTRA
+        Write-Host "`n=== Protecting Standard Runnable JAR (ULTRA + Native VM + --encrypt-dll) ==="
+        & $Java -cp $cp dev.hydro.j2c.Main -i $AppJar -o $ProtAppUltraJar -d $ProtAppUltraDll --tier ULTRA --encrypt-dll
         if ($LASTEXITCODE -ne 0) { throw "Standard JAR ULTRA protection failed" }
+
+        $zUltra = [System.IO.Compression.ZipFile]::OpenRead($ProtAppUltraJar)
+        $uDllEnt = $zUltra.GetEntry("natives/windows-x86_64/test-app-ultra.dll")
+        if (-not $uDllEnt) { $zUltra.Dispose(); throw "Missing encrypted DLL payload in JAR!" }
+        $uStream = $uDllEnt.Open()
+        $uHdr = New-Object byte[] 2
+        $uStream.Read($uHdr, 0, 2) | Out-Null
+        $uStream.Dispose()
+        # Verify encrypted DLL payload does not start with plaintext PE 'MZ' header
+        if ($uHdr[0] -eq 0x4D -and $uHdr[1] -eq 0x5A) { $zUltra.Dispose(); throw "--encrypt-dll FAILED: plaintext MZ header inside JAR!" }
+        # Verify HLoader has zero plaintext loader strings in bytecode
+        $loaderEntry = $zUltra.Entries | Where-Object { $_.FullName -match "^dev/hydro/rt/H_.*\.class$" } | Select-Object -First 1
+        if (-not $loaderEntry) { $zUltra.Dispose(); throw "Missing HLoader class in JAR!" }
+        $msL = New-Object System.IO.MemoryStream
+        $ls = $loaderEntry.Open(); $ls.CopyTo($msL); $ls.Dispose()
+        $loaderText = [System.Text.Encoding]::ASCII.GetString($msL.ToArray())
+        foreach ($lstr in @("os.name", "os.arch", "/natives/", "Missing native payload")) {
+            if ($loaderText.Contains($lstr)) { $zUltra.Dispose(); throw "HLoader leaked plaintext string '$lstr'!" }
+        }
+        $zUltra.Dispose()
+        Write-Host "[Loader+EncDllAudit] Encrypted DLL payload (!MZ) + 0 plaintext HLoader strings OK!"
 
         Write-Host "`n=== Launching java -jar test-app-ultra.jar directly ==="
         $appOutUltra = & $Java -jar $ProtAppUltraJar 9 ultraRun
@@ -249,6 +271,18 @@ switch ($Action.ToLower()) {
         if ("$appOutUltra" -notmatch "APP_OK\|args=9,ultraRun\|.*HYDRO_APP_BANNER_2026.*ERR:NEGATIVE_SEED:-3") {
             throw "Unexpected output from test-app-ultra.jar: $appOutUltra"
         }
+
+        $zAnn = [System.IO.Compression.ZipFile]::OpenRead($ProtAppUltraJar)
+        $ecEnt = $zAnn.GetEntry("app/demo/EngineContract.class")
+        if (-not $ecEnt) { $zAnn.Dispose(); throw "Missing EngineContract.class in test-app-ultra.jar" }
+        $msEc = New-Object System.IO.MemoryStream
+        $esEc = $ecEnt.Open(); $esEc.CopyTo($msEc); $esEc.Dispose()
+        $zAnn.Dispose()
+        $ecText = [System.Text.Encoding]::ASCII.GetString($msEc.ToArray())
+        if ($ecText.Contains("CONTRACT-V1")) {
+            throw "Residual Java string encryption FAILED: 'CONTRACT-V1' plaintext in EngineContract.class!"
+        }
+        Write-Host "[ResidualJavaHardening] Interface & startup .class files have 0 plaintext strings!"
 
         Write-Host "`n=== Standard JAR Annotation-Only (-a) test (Main unannotated -> HLoader.boot) ==="
         $appAnnSources = Get-ChildItem -Recurse (Join-Path $Root "src\test-app\java\app\annot") -Filter "*.java" | ForEach-Object { $_.FullName }
@@ -418,17 +452,27 @@ switch ($Action.ToLower()) {
                 throw "CRITICAL: Server DLL PE TimeDateStamp not zeroed!"
             }
             $dllStr = [System.Text.Encoding]::ASCII.GetString($srvDllRaw)
-            if ($dllStr.Contains($mfObj.vmShareHex) -or $dllStr.Contains($mfObj.vaultShareHex)) {
-                throw "CRITICAL: Server key shares leaked into DLL!"
+            if ($dllStr.Contains($mfObj.vmShareHex) -or $dllStr.Contains($mfObj.vaultShareHex) -or $dllStr.Contains($mfObj.dynParamsHex.Substring(0, 16))) {
+                throw "CRITICAL: Server key shares or dynParams leaked into DLL!"
             }
             foreach ($sleak in @(
                 "winhttp.dll", "advapi32.dll", "bcrypt.dll", "BCryptGenRandom",
-                "WinHttpOpen", "RegOpenKeyExA", "/api/v1/session", "HY-HS-AUTH",
-                "HY-SESS-V1", "HY-HWID-V1", "sessionId", "srvEphPub", "serverNonce",
+                "WinHttpOpen", "RegOpenKeyExA", "CreateFileA", "/api/v1/session", "HY-HS-AUTH",
+                "HY-REQ-E2", "HY-REQ-M2", "HY-SESS-V1", "HY-SESS-V2", "HY-HWID-V1",
+                "HBQ|", "LOGOUT|", "sessionId", "srvEphPub", "serverNonce",
                 "nonce12", "ciphertext", "HydroAgent/1.0", "Content-Type: application/json"
             )) {
                 if ($dllStr.Contains($sleak)) { throw "SECURITY LEAK: Server DLL leaked plaintext '$sleak'!" }
             }
+
+            # 0) Verify plaintext / spoofed non-E2EE handshake is rejected by Spring server
+            $badHsOk = $false
+            try {
+                Invoke-RestMethod -Method Post -Uri "$srvUrl/api/v1/session/handshake" -ContentType "application/json" -Body '{"productId":"hydro-app","licenseKey":"FAKE"}' -TimeoutSec 2 | Out-Null
+                $badHsOk = $true
+            } catch {}
+            if ($badHsOk) { throw "Server accepted non-E2EE handshake!" }
+            Write-Host "[ServerE2EE] Unencrypted/malformed handshake envelope rejected"
 
             # 1) Reject launch without license key
             $prevEap3 = $ErrorActionPreference
@@ -448,7 +492,25 @@ switch ($Action.ToLower()) {
             $srvOut21 = & $Java "-Dhydro.key=$licKey" -jar $ProtSrvJar 21 srvCheck
             if ($LASTEXITCODE -ne 0) { throw "Licensed execution failed (exit=$LASTEXITCODE)" }
             if ("$srvOut21" -ne "$unprot21") { throw "Server-ULTRA parity mismatch: '$srvOut21' vs '$unprot21'" }
-            Write-Host "[ServerAuth] Valid X25519+ChaCha20 session & parity OK: $srvOut21"
+            Write-Host "[ServerAuth] Valid X25519+ChaCha20 (E2EE v2) session & parity OK: $srvOut21"
+
+            # 2b) Verify Server-bound CFF (STRONG tier using srvDynParams) also rejects noKey and matches parity with key
+            $ProtSrvCffJar = Join-Path $Root "build\test-app-srv-cff.jar"
+            $ProtSrvCffDll = Join-Path $Root "build\test-app-srv-cff.dll"
+            & $Java -cp $cp dev.hydro.j2c.Main -i $AppJar -o $ProtSrvCffJar -d $ProtSrvCffDll --tier STRONG `
+                --server-url $srvUrl --server-pubkey $srvPub --product-id "hydro-app" `
+                --server-admin-token $adminTok --server-heartbeat-sec 2
+            if ($LASTEXITCODE -ne 0) { throw "Server-bound STRONG CFF protection failed" }
+            $prevEap3b = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+            & $Java -jar $ProtSrvCffJar 21 noKey 2>&1 | Out-Null
+            $cffNoKeyExit = $LASTEXITCODE
+            $ErrorActionPreference = $prevEap3b
+            if ($cffNoKeyExit -eq 0) { throw "Server-bound STRONG CFF ran WITHOUT license key!" }
+            $cffSrvOut = & $Java "-Dhydro.key=$licKey" -jar $ProtSrvCffJar 21 srvCheck
+            if ($LASTEXITCODE -ne 0 -or "$cffSrvOut" -ne "$unprot21") {
+                throw "Server-STRONG CFF execution/parity failed (exit=$LASTEXITCODE out='$cffSrvOut')"
+            }
+            Write-Host "[ServerCFF] Server-bound CFF state coupling + session eviction OK"
 
             # 3) Live rolling heartbeat + real-time admin revocation test
             $watchOutLog = Join-Path $Root "build\test-watch.out"

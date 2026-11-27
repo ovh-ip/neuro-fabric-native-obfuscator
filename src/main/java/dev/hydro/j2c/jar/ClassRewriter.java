@@ -1,6 +1,7 @@
 package dev.hydro.j2c.jar;
 
 import dev.hydro.j2c.config.ObfuscationConfig;
+import dev.hydro.j2c.preprocess.JavaPreHardener;
 import org.objectweb.asm.*;
 import org.objectweb.asm.tree.*;
 
@@ -140,8 +141,22 @@ public final class ClassRewriter implements Opcodes {
             String embeddedResPath,
             long dllKeySeed,
             ObfuscationConfig config) {
+        return generateLoaderClass(loaderInternalName, regMethodName, verifyMethodName, bootMethodName,
+                libBaseName, embeddedResPath, dllKeySeed, config, new Random(dllKeySeed));
+    }
 
-        ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
+    public static byte[] generateLoaderClass(
+            String loaderInternalName,
+            String regMethodName,
+            String verifyMethodName,
+            String bootMethodName,
+            String libBaseName,
+            String embeddedResPath,
+            long dllKeySeed,
+            ObfuscationConfig config,
+            Random rng) {
+
+        ClassNode cw = new ClassNode();
         cw.visit(V17, ACC_PUBLIC | ACC_FINAL | ACC_SYNTHETIC, loaderInternalName, null, "java/lang/Object", null);
 
         // public static native void r(Class<?> cls, int id)
@@ -199,20 +214,34 @@ public final class ClassRewriter implements Opcodes {
 
                 mv.visitLabel(loopBody);
                 mv.visitVarInsn(LLOAD, 2);
-                mv.visitLdcInsn(6364136223846793005L);
-                mv.visitInsn(LMUL);
-                mv.visitLdcInsn(1442695040888963407L);
+                mv.visitLdcInsn(0x9E3779B97F4A7C15L);
                 mv.visitInsn(LADD);
+                mv.visitInsn(DUP2);
                 mv.visitVarInsn(LSTORE, 2);
+                mv.visitInsn(DUP2);
+                mv.visitIntInsn(BIPUSH, 30);
+                mv.visitInsn(LUSHR);
+                mv.visitInsn(LXOR);
+                mv.visitLdcInsn(0xBF58476D1CE4E5B9L);
+                mv.visitInsn(LMUL);
+                mv.visitInsn(DUP2);
+                mv.visitIntInsn(BIPUSH, 27);
+                mv.visitInsn(LUSHR);
+                mv.visitInsn(LXOR);
+                mv.visitVarInsn(ILOAD, 4);
+                mv.visitIntInsn(BIPUSH, 7);
+                mv.visitInsn(IAND);
+                mv.visitInsn(ICONST_3);
+                mv.visitInsn(ISHL);
+                mv.visitInsn(LUSHR);
+                mv.visitInsn(L2I);
+                mv.visitVarInsn(ISTORE, 7);
 
                 mv.visitVarInsn(ALOAD, 1);
                 mv.visitVarInsn(ILOAD, 4);
                 mv.visitInsn(DUP2);
                 mv.visitInsn(BALOAD);
-                mv.visitVarInsn(LLOAD, 2);
-                mv.visitIntInsn(BIPUSH, 56);
-                mv.visitInsn(LUSHR);
-                mv.visitInsn(L2I);
+                mv.visitVarInsn(ILOAD, 7);
                 mv.visitInsn(IXOR);
                 mv.visitInsn(I2B);
                 mv.visitInsn(BASTORE);
@@ -355,10 +384,11 @@ public final class ClassRewriter implements Opcodes {
         }
 
         cw.visitEnd();
-        return cw.toByteArray();
+        JavaPreHardener.hardenResidualBytecode(cw, rng);
+        return writeClass(cw, Collections.emptyMap());
     }
 
-    private static void emitPlatformHelpers(ClassWriter cw, String loaderInternalName) {
+    private static void emitPlatformHelpers(ClassVisitor cw, String loaderInternalName) {
         // osTag() -> "windows" | "macos" | "linux"
         MethodVisitor om = cw.visitMethod(ACC_PRIVATE | ACC_STATIC, "osTag", "()Ljava/lang/String;", null, null);
         om.visitCode();
@@ -616,8 +646,10 @@ public final class ClassRewriter implements Opcodes {
         byte[] enc = Arrays.copyOf(raw, raw.length);
         long state = keySeed;
         for (int i = 0; i < enc.length; i++) {
-            state = state * 6364136223846793005L + 1442695040888963407L;
-            enc[i] ^= (byte) (state >>> 56);
+            state += 0x9E3779B97F4A7C15L;
+            long z = (state ^ (state >>> 30)) * 0xBF58476D1CE4E5B9L;
+            z ^= (z >>> 27);
+            enc[i] ^= (byte) ((z >>> ((i & 7) << 3)) & 0xFF);
         }
         return enc;
     }

@@ -62,7 +62,13 @@ public final class CppRuntimeEmitter {
     }
 
     public static String emitExportsDef() {
-        return "EXPORTS\nJNI_OnLoad\n";
+        return emitExportsDef(false);
+    }
+
+    public static String emitExportsDef(boolean withUnload) {
+        return withUnload
+                ? "EXPORTS\nJNI_OnLoad\nJNI_OnUnload\n"
+                : "EXPORTS\nJNI_OnLoad\n";
     }
 
     private static long computeOneWayVerifyTag(long h, long tagSalt, long hashPrime, long vaultSaltBase) {
@@ -85,6 +91,7 @@ public final class CppRuntimeEmitter {
             long expectedJarHash,
             long vaultSaltBase,
             long serverVmShare,
+            long[] srvDynParams,
             String productId,
             String buildId,
             List<String> jarVerifyResources,
@@ -200,15 +207,15 @@ public final class CppRuntimeEmitter {
         int symCtype = pool.internSym(srv ? "Content-Type: application/json\r\n" : "");
         int symEpHs = pool.internSym(srv ? "/api/v1/session/handshake" : "");
         int symEpHb = pool.internSym(srv ? "/api/v1/session/heartbeat" : "");
+        int symEpLo = pool.internSym(srv ? "/api/v1/session/logout" : "");
         int symHwidTag = pool.internSym(srv ? "HY-HWID-V1" : "");
-        int symHsPfx = pool.internSym(srv ? "HY-HS-AUTH|" : "");
-        int symSessPfx = pool.internSym(srv ? "HY-SESS-V1|" : "");
-        int symJSess = pool.internSym(srv ? "sessionId" : "");
-        int symJSEph = pool.internSym(srv ? "srvEphPub" : "");
-        int symJSNonce = pool.internSym(srv ? "serverNonce" : "");
-        int symJNonce = pool.internSym(srv ? "nonce12" : "");
-        int symJCt = pool.internSym(srv ? "ciphertext" : "");
-        int symJMac = pool.internSym(srv ? "mac" : "");
+        int symReqE2 = pool.internSym(srv ? "HY-REQ-E2" : "");
+        int symReqM2 = pool.internSym(srv ? "HY-REQ-M2" : "");
+        int symSessPfx = pool.internSym(srv ? "HY-SESS-V2|" : "");
+        int symHbqPfx = pool.internSym(srv ? "HBQ|" : "");
+        int symHbPfx = pool.internSym(srv ? "HB|" : "");
+        int symLoqPfx = pool.internSym(srv ? "LOQ|" : "");
+        int symLoPfx = pool.internSym(srv ? "LOGOUT|" : "");
 
         int[] verifyResSyms = new int[jarVerifyResources.size()];
         for (int i = 0; i < jarVerifyResources.size(); i++) {
@@ -218,7 +225,8 @@ public final class CppRuntimeEmitter {
         boolean verifyJar = (config.isAntiTamper() || config.isServerEnabled()) && !jarVerifyResources.isEmpty();
         long effectiveKey = verifyJar ? expectedJarHash : (crypto.getMasterSeed() ^ crypto.getTagSalt());
         long verifyTag = computeOneWayVerifyTag(effectiveKey, crypto.getTagSalt(), crypto.getHashPrime(), vaultSaltBase);
-        long sealedVmKey = isa.keySeed ^ CryptoEngine.splitMix64(effectiveKey ^ crypto.getTagSalt()) ^ serverVmShare;
+        long dyn0 = (srvDynParams != null && srvDynParams.length > 0) ? srvDynParams[0] : 0L;
+        long sealedVmKey = isa.keySeed ^ CryptoEngine.splitMix64(effectiveKey ^ crypto.getTagSalt()) ^ serverVmShare ^ dyn0;
 
         // Intern and blind .fucked metadata under live JAR key `effectiveKey`
         List<long[]> fuckedMetaRows = new ArrayList<>();
@@ -316,7 +324,16 @@ public final class CppRuntimeEmitter {
         cfg.append("#define HY_HASH_FRIDA_GADGET ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32LowerAscii("frida-gadget.dll"))).append("u\n");
         cfg.append("#define HY_HASH_X64DBG ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32LowerAscii("x64dbg.dll"))).append("u\n");
         cfg.append("#define HY_HASH_SCYLLA ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32LowerAscii("scyllahide.dll"))).append("u\n");
-        cfg.append("#define HY_HASH_VEHDBG ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32LowerAscii("vehdebug-x86_64.dll"))).append("u\n\n");
+        cfg.append("#define HY_HASH_VEHDBG ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32LowerAscii("vehdebug-x86_64.dll"))).append("u\n");
+        cfg.append("#define HY_HASH_FRIDA_CORE ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32LowerAscii("frida-core.dll"))).append("u\n");
+        cfg.append("#define HY_HASH_VEHDBG32 ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32LowerAscii("vehdebug-i386.dll"))).append("u\n");
+        cfg.append("#define HY_HASH_CE64 ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32LowerAscii("cheatengine-x86_64.dll"))).append("u\n");
+        cfg.append("#define HY_HASH_TITAN ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32LowerAscii("titanengine.dll"))).append("u\n");
+        cfg.append("#define HY_HASH_SHARPOD ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32LowerAscii("sharpod.dll"))).append("u\n");
+        cfg.append("#define HY_HASH_MINHOOK64 ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32LowerAscii("minhook.x64.dll"))).append("u\n");
+        cfg.append("#define HY_HASH_CREATEFILEA ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32("CreateFileA"))).append("u\n");
+        cfg.append("#define HY_HASH_READFILE ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32("ReadFile"))).append("u\n");
+        cfg.append("#define HY_HASH_CLOSEHANDLE ").append(CryptoEngine.hex32(CryptoEngine.fnv1a32("CloseHandle"))).append("u\n\n");
 
         defSym(cfg, "HY_SYM_CLASS", symClass);
         defSym(cfg, "HY_SYM_FORNAME", symForName);
@@ -421,19 +438,21 @@ public final class CppRuntimeEmitter {
         defSym(cfg, "HY_SYM_CTYPE", symCtype);
         defSym(cfg, "HY_SYM_EP_HS", symEpHs);
         defSym(cfg, "HY_SYM_EP_HB", symEpHb);
+        defSym(cfg, "HY_SYM_EP_LO", symEpLo);
         defSym(cfg, "HY_SYM_HWID_TAG", symHwidTag);
-        defSym(cfg, "HY_SYM_HS_PFX", symHsPfx);
+        defSym(cfg, "HY_SYM_REQ_E2", symReqE2);
+        defSym(cfg, "HY_SYM_REQ_M2", symReqM2);
         defSym(cfg, "HY_SYM_SESS_PFX", symSessPfx);
-        defSym(cfg, "HY_SYM_J_SESS", symJSess);
-        defSym(cfg, "HY_SYM_J_SEPH", symJSEph);
-        defSym(cfg, "HY_SYM_J_SNONCE", symJSNonce);
-        defSym(cfg, "HY_SYM_J_NONCE", symJNonce);
-        defSym(cfg, "HY_SYM_J_CT", symJCt);
-        defSym(cfg, "HY_SYM_J_MAC", symJMac);
+        defSym(cfg, "HY_SYM_HBQ_PFX", symHbqPfx);
+        defSym(cfg, "HY_SYM_HB_PFX", symHbPfx);
+        defSym(cfg, "HY_SYM_LOQ_PFX", symLoqPfx);
+        defSym(cfg, "HY_SYM_LO_PFX", symLoPfx);
         cfg.append("\n");
 
         int dispMul = ((int) CryptoEngine.splitMix64(crypto.getMasterSeed() ^ 0x517CC1B727220A95L)) | 1;
         int dispXor = (int) (CryptoEngine.splitMix64(crypto.getTagSalt() ^ 0x9E3779B97F4A7C15L) >>> 17);
+        long sessAliveMagic = CryptoEngine.splitMix64(crypto.getMasterSeed() ^ vaultSaltBase ^ 0xA5A55A5AF0F00F0FL);
+        if (sessAliveMagic == 0L) sessAliveMagic = 0x6A09E667F3BCC909L;
 
         // MBA-masked key expressions anchored to runtime opaque seed `op`
         cfg.append("#define HY_MBA_MASTER_SEED(op) ").append(crypto.mbaConst64WithVar(crypto.getMasterSeed(), "(op)", true)).append("\n");
@@ -446,7 +465,8 @@ public final class CppRuntimeEmitter {
         cfg.append("#define HY_MBA_VM_MIX_CONST(op) ").append(crypto.mbaConst64WithVar(isa.streamMixConst, "(op)", true)).append("\n");
         cfg.append("#define HY_MBA_VM_MIX_MUL(op) ").append(crypto.mbaConst64WithVar(isa.streamMixMul, "(op)", true)).append("\n");
         cfg.append("#define HY_MBA_VM_DISP_MUL(op) ").append(crypto.mbaConst64WithVar(Integer.toUnsignedLong(dispMul), "(op)", true)).append("\n");
-        cfg.append("#define HY_MBA_VM_DISP_XOR(op) ").append(crypto.mbaConst64WithVar(Integer.toUnsignedLong(dispXor), "(op)", true)).append("\n\n");
+        cfg.append("#define HY_MBA_VM_DISP_XOR(op) ").append(crypto.mbaConst64WithVar(Integer.toUnsignedLong(dispXor), "(op)", true)).append("\n");
+        cfg.append("#define HY_MBA_SESS_ALIVE_MAGIC(op) ").append(crypto.mbaConst64WithVar(sessAliveMagic, "(op)", true)).append("\n\n");
 
         // Shuffled + 32-bit sparse bijective VM opcodes (defeats dense jump-table recovery) + unused trap cases
         for (VmIsa.Op op : VmIsa.Op.values()) {
