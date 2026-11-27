@@ -27,9 +27,10 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.jar.*;
 import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 /**
- * End-to-end J2C & Native VM pipeline for Java / Minecraft Fabric mod JARs.
+ * End-to-end J2C & Native VM pipeline for standard Java JARs (runnable/library) and Minecraft Fabric mods.
  */
 public final class JarProcessor implements Opcodes {
 
@@ -56,34 +57,38 @@ public final class JarProcessor implements Opcodes {
         Map<String, byte[]> resources = new LinkedHashMap<>();
         Map<String, ClassNode> classes = new LinkedHashMap<>();
 
-        try (JarInputStream jis = new JarInputStream(Files.newInputStream(config.getInputJar()))) {
-            Manifest mf = jis.getManifest();
-            if (mf != null) {
-                ByteArrayOutputStream mbo = new ByteArrayOutputStream();
-                mf.write(mbo);
-                resources.put("META-INF/MANIFEST.MF", mbo.toByteArray());
-            }
-            JarEntry entry;
-            while ((entry = jis.getNextJarEntry()) != null) {
+        try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(config.getInputJar()))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
                 if (entry.isDirectory()) continue;
                 String name = entry.getName();
-                byte[] data = jis.readAllBytes();
-                if (name.endsWith(".class") && !name.startsWith("META-INF/")) {
+                if (isJarSignatureFile(name)) continue;
+                byte[] data = zis.readAllBytes();
+                if ("META-INF/MANIFEST.MF".equals(name)) {
+                    resources.put(name, ensureManifestTrailingNewline(data));
+                } else if (name.endsWith(".class") && !name.startsWith("META-INF/")) {
                     ClassNode cn = new ClassNode();
                     new ClassReader(data).accept(cn, ClassReader.EXPAND_FRAMES);
                     classes.put(cn.name, cn);
-                } else if (!"META-INF/MANIFEST.MF".equals(name)) {
+                } else {
                     resources.put(name, data);
                 }
             }
         }
 
         FabricMetadata fabricMeta = FabricMetadata.parse(resources);
+        JarMetadata jarMeta = JarMetadata.parse(resources);
         if (config.getIncludePatterns().isEmpty() && fabricMeta.isFabricMod() && !fabricMeta.getDetectedPackages().isEmpty()) {
             for (String p : fabricMeta.getDetectedPackages()) {
                 config.getIncludePatterns().add(p + "/**");
             }
         }
+        String jarKind = fabricMeta.isFabricMod()
+                ? "Fabric Mod (" + fabricMeta.getModId() + ")"
+                : (!jarMeta.getEntrypointClasses().isEmpty()
+                    ? "Runnable/Agent JAR (Main-Class=" + jarMeta.getMainClass() + ")"
+                    : "Standard Library JAR");
+        System.out.println("[HydroJ2C] Target mode: " + jarKind);
 
         String randTag = Long.toUnsignedString(rng.nextLong(), 36);
         String loaderInternal = "dev/hydro/rt/H_" + randTag;
@@ -134,6 +139,10 @@ public final class JarProcessor implements Opcodes {
             if (config.isStripDebugInfo()) {
                 JavaPreHardener.stripDebugInfo(cn);
             }
+            if ((cn.access & ACC_INTERFACE) != 0) {
+                classEligibleMethods.put(cn, Set.of());
+                continue;
+            }
             Set<MethodNode> lambdas = AnnotationFilter.collectLambdaTargets(cn, config);
             Set<MethodNode> eligibleSet = Collections.newSetFromMap(new IdentityHashMap<>());
             if (cn.methods != null) {
@@ -156,11 +165,12 @@ public final class JarProcessor implements Opcodes {
         Path outDll = config.getOutputDll();
         if (outDll == null) {
             String base = config.getOutputJar().getFileName().toString().replaceAll("\\.jar$", "");
-            outDll = config.getOutputJar().toAbsolutePath().getParent().resolve(base + ".dll");
+            outDll = config.getOutputJar().toAbsolutePath().getParent().resolve(NativeCompiler.formatHostLibFileName(base));
             config.setOutputDll(outDll);
         }
         String dllName = outDll.getFileName().toString();
-        String embeddedResPath = "natives/" + dllName;
+        String libBaseName = NativeCompiler.stripLibNameToBase(dllName);
+        String embeddedResPath = "natives/" + NativeCompiler.hostOsTag() + "-" + NativeCompiler.hostArchTag() + "/" + dllName;
         long dllEncKey = rng.nextLong();
 
         List<String> methodCpus = new ArrayList<>();
@@ -172,6 +182,7 @@ public final class JarProcessor implements Opcodes {
         int cffCount = 0;
         int vmCount = 0;
 
+        Set<String> registeredClassNames = new HashSet<>();
         for (ClassNode cn : targetClasses) {
             boolean isMixin = MixinOutliner.isMixinClass(cn, fabricMeta);
             if (isMixin && config.isProcessMixins()) continue;
@@ -196,7 +207,7 @@ public final class JarProcessor implements Opcodes {
                 if (useVm) {
                     try {
                         VmCompiler.CompiledVmMethod vm = VmCompiler.compile(
-                                vmMethods.size(), cn.name, mn, cFuncName, frames, vmIsa, pool);
+                                vmMethods.size(), cn.name, mn, cFuncName, frames, mCtx, vmIsa, pool, rng);
                         vmMethods.add(vm);
                         regMethodsForClass.add(new CppRuntimeEmitter.RegisteredMethod(mn.name, mn.desc, cFuncName));
                         ClassRewriter.makeMethodNative(mn);
@@ -223,6 +234,7 @@ public final class JarProcessor implements Opcodes {
             if (!regMethodsForClass.isEmpty()) {
                 int cid = classIdSeq++;
                 regClasses.add(new CppRuntimeEmitter.RegisteredClass(cid, cn.name, regMethodsForClass));
+                registeredClassNames.add(cn.name);
                 ClassRewriter.injectClassRegistration(cn, cid, loaderInternal, regMethodName);
             }
         }
@@ -236,15 +248,24 @@ public final class JarProcessor implements Opcodes {
         }
 
         // 4. Populate junk classes, nested junk directories, and decoy .fucked blobs
+        int dominantClassVersion = Opcodes.V17;
+        for (ClassNode cn : classes.values()) {
+            if (cn.version > dominantClassVersion) dominantClassVersion = cn.version;
+        }
         List<String> fuckedDirs = new ArrayList<>();
         int resBeforeJunk = resources.size();
-        JunkGenerator.populateJunk(resources, classes.keySet(), fuckedDirs, config.getJunkCount(), rng);
+        JunkGenerator.populateJunk(
+                resources, classes.keySet(), fuckedDirs, config.getJunkCount(),
+                fabricMeta.isFabricMod(), dominantClassVersion, rng);
         int junkAdded = resources.size() - resBeforeJunk;
 
-        // 5. Generate HLoader + serialize classes (encrypting eligible target classes into .fucked!)
+        // 5. Compute startup-visible classes that must remain valid .class files before HLoader unpacks .fucked
+        Set<String> startupStayClasses = computeStartupStayClasses(
+                classes, fabricMeta, jarMeta, mixinTargets, targetClasses);
+
         byte[] loaderBytes = ClassRewriter.generateLoaderClass(
                 loaderInternal, regMethodName, verifyMethodName, bootMethodName,
-                embeddedResPath, dllEncKey, config);
+                libBaseName, embeddedResPath, dllEncKey, config);
 
         Map<String, byte[]> finalClassBytes = new LinkedHashMap<>();
         List<ClassNode> fuckedCandidates = new ArrayList<>();
@@ -252,10 +273,12 @@ public final class JarProcessor implements Opcodes {
         for (ClassNode cn : classes.values()) {
             boolean mustStayClass = !config.isFuckedClasses()
                     || !targetClasses.contains(cn)
-                    || fabricMeta.getEntrypointClasses().contains(cn.name)
-                    || MixinOutliner.isMixinClass(cn, fabricMeta)
-                    || mixinTargets.contains(cn.name);
+                    || startupStayClasses.contains(cn.name);
             if (mustStayClass) {
+                if (!registeredClassNames.contains(cn.name)
+                        && needsStartupBootHook(cn, fabricMeta, jarMeta, startupStayClasses)) {
+                    ClassRewriter.injectLoaderBoot(cn, loaderInternal, bootMethodName);
+                }
                 finalClassBytes.put(cn.name + ".class", ClassRewriter.writeClass(cn, classes));
             } else {
                 fuckedCandidates.add(cn);
@@ -266,12 +289,16 @@ public final class JarProcessor implements Opcodes {
         // Topologically sort .fucked classes (superclasses, interfaces, outer NestHost before subclasses/inners)
         List<ClassNode> sortedFucked = topoSortClasses(fuckedCandidates);
         List<CppRuntimeEmitter.FuckedEntry> fuckedEntries = new ArrayList<>();
+        long vaultSaltBase = crypto.getHashBasis() ^ crypto.getTagSalt();
+        long serverVmShare = config.isServerEnabled() ? rng.nextLong() : 0L;
+        long serverVaultShare = config.isServerEnabled() ? rng.nextLong() : 0L;
+        long effectiveFuckedVaultSalt = vaultSaltBase ^ serverVaultShare;
 
         for (ClassNode cn : sortedFucked) {
             byte[] rawBytes = ClassRewriter.writeClass(cn, classes);
             long fileSeed = rng.nextLong();
-            long mac = fnvUpdate(0xCBF29CE484222325L, rawBytes);
-            byte[] encBytes = ClassRewriter.encryptFuckedClass(rawBytes, fileSeed);
+            long mac = crypto.hash64(rawBytes);
+            byte[] encBytes = ClassRewriter.encryptFuckedClass(rawBytes, fileSeed, effectiveFuckedVaultSalt, 640, rng);
 
             String dir = fuckedDirs.isEmpty()
                     ? (cn.name.contains("/") ? cn.name.substring(0, cn.name.lastIndexOf('/')) : "dev/hydro/v4")
@@ -285,19 +312,30 @@ public final class JarProcessor implements Opcodes {
             fuckedEntries.add(new CppRuntimeEmitter.FuckedEntry(cn.name, resPath, rawBytes.length, fileSeed, mac));
         }
 
-        // Compute JAR integrity fingerprint over HLoader + fabric.mod.json (if present)
+        // Compute JAR integrity fingerprint over HLoader + fabric.mod.json / META-INF/MANIFEST.MF (if present)
         List<String> verifyResources = new ArrayList<>();
-        long jarHash = 0xCBF29CE484222325L;
+        long jarHash = crypto.getHashBasis();
         if (resources.containsKey("fabric.mod.json")) {
             verifyResources.add("fabric.mod.json");
-            jarHash = fnvUpdate(jarHash, resources.get("fabric.mod.json"));
+            jarHash = crypto.hash64Update(jarHash, resources.get("fabric.mod.json"));
+        } else if (resources.containsKey("META-INF/MANIFEST.MF")) {
+            verifyResources.add("META-INF/MANIFEST.MF");
+            jarHash = crypto.hash64Update(jarHash, resources.get("META-INF/MANIFEST.MF"));
         }
         verifyResources.add(loaderInternal + ".class");
-        jarHash = fnvUpdate(jarHash, loaderBytes);
+        jarHash = crypto.hash64Update(jarHash, loaderBytes);
 
-        // 6. Partition C++ methods into parallel compilation shards
+        // Derive productId & buildId for optional Spring server binding
+        String productId = (config.getProductId() != null && !config.getProductId().isBlank())
+                ? config.getProductId()
+                : (fabricMeta.isFabricMod() ? fabricMeta.getModId() : libBaseName);
+        String buildId = (config.getBuildId() != null && !config.getBuildId().isBlank())
+                ? config.getBuildId()
+                : "bld_" + Long.toUnsignedString(rng.nextLong(), 36);
+
+        // 6. Partition C++ methods & VM JNI stubs into parallel compilation shards
         List<String> shards = new ArrayList<>();
-        int perShard = config.getMethodsPerShard();
+        int perShard = Math.max(1, config.getMethodsPerShard());
         for (int i = 0; i < methodCpus.size(); i += perShard) {
             StringBuilder ssb = new StringBuilder();
             ssb.append("#include \"hydro_runtime.hpp\"\n\n");
@@ -307,31 +345,80 @@ public final class JarProcessor implements Opcodes {
             shards.add(ssb.toString());
         }
 
-        String header = CppRuntimeEmitter.emitHeader();
-        String runtimeCpp = CppRuntimeEmitter.emitRuntimeCpp(
-                pool, crypto, regClasses, fuckedEntries,
+        Map<String, String> coreNativeFiles = CppRuntimeEmitter.loadCoreNativeFiles();
+        CppRuntimeEmitter.GeneratedRuntime genRt = CppRuntimeEmitter.generateBuildRuntime(
+                pool, crypto, regClasses, fuckedEntries, vmMethods, vmIsa,
                 loaderInternal, regMethodName, verifyMethodName,
-                jarHash, verifyResources, config);
-        String vmCpp = CppRuntimeEmitter.emitVmCppWithHelpers(vmMethods, vmIsa, crypto);
+                jarHash, vaultSaltBase, serverVmShare, productId, buildId, verifyResources, config);
+        shards.addAll(genRt.vmStubShards());
         String exportsDef = CppRuntimeEmitter.emitExportsDef();
 
         byte[] symBlobBytes = concatSymBlob(pool);
 
-        // 7. Compile native Windows x64 DLL
+        // Emit Spring server build manifest (and optionally auto-register onto --server-url)
+        if (config.isServerEnabled()) {
+            StringBuilder dynHex = new StringBuilder();
+            for (int d = 0; d < 8; d++) {
+                dynHex.append(dev.hydro.j2c.crypto.HydroCrypto.hex64Padded(rng.nextLong()));
+            }
+            String manifestJson = """
+                    {
+                      "productId": "%s",
+                      "buildId": "%s",
+                      "jarDigest": "%s",
+                      "symDigest": "%s",
+                      "vmShareHex": "%s",
+                      "vaultShareHex": "%s",
+                      "dynParamsHex": "%s",
+                      "note": "HydroJ2C build manifest"
+                    }
+                    """.formatted(
+                    escJson(productId),
+                    escJson(buildId),
+                    dev.hydro.j2c.crypto.HydroCrypto.hex64Padded(jarHash),
+                    dev.hydro.j2c.crypto.HydroCrypto.hex64Padded(crypto.hash64(symBlobBytes)),
+                    dev.hydro.j2c.crypto.HydroCrypto.hex64Padded(serverVmShare),
+                    dev.hydro.j2c.crypto.HydroCrypto.hex64Padded(serverVaultShare),
+                    dynHex.toString()
+            );
+            Path mfPath = config.getManifestOut() != null
+                    ? config.getManifestOut()
+                    : config.getOutputJar().toAbsolutePath().getParent().resolve(
+                        config.getOutputJar().getFileName().toString().replaceAll("\\.jar$", "") + "-server.json");
+            if (mfPath.getParent() != null) Files.createDirectories(mfPath.getParent());
+            Files.writeString(mfPath, manifestJson, java.nio.charset.StandardCharsets.UTF_8);
+            if (config.getServerAdminToken() != null && !config.getServerAdminToken().isBlank()) {
+                registerBuildOnServer(config.getServerUrl(), config.getServerAdminToken(), manifestJson);
+            }
+        }
+
+        // 7. Compile native library (direct or via CMake, plus optional --cmake-out export)
         Path buildDir = Files.createTempDirectory("hydro_cpp_");
         try {
-            NativeCompiler.compileDll(
-                    buildDir, outDll, header, runtimeCpp, vmCpp, exportsDef, shards, symBlobBytes, config);
+            NativeCompiler.compileNative(
+                    buildDir, outDll, libBaseName, coreNativeFiles,
+                    genRt.buildCfgHpp(), genRt.tablesCpp(),
+                    exportsDef, shards, symBlobBytes, crypto, config);
         } finally {
             deleteRecursive(buildDir);
         }
 
-        // 8. Package natives/<dllName> directly inside the JAR (and encrypt if --encrypt-dll)
+        // 8. Package natives/<os>-<arch>/<lib> (plus any prebuilt multi-OS libs from --natives-dir) inside the JAR
         if (config.isEmbedDll()) {
             byte[] rawDll = Files.readAllBytes(outDll);
             resources.put(embeddedResPath, config.isEncryptEmbeddedDll()
                     ? ClassRewriter.encryptDllPayload(rawDll, dllEncKey)
                     : rawDll);
+            if (config.getPrebuiltNativesDir() != null) {
+                Map<String, byte[]> extraNatives = NativeCompiler.collectPrebuiltNatives(config.getPrebuiltNativesDir(), libBaseName);
+                for (Map.Entry<String, byte[]> ne : extraNatives.entrySet()) {
+                    if (ne.getKey().equals(embeddedResPath)) continue;
+                    byte[] payload = config.isEncryptEmbeddedDll()
+                            ? ClassRewriter.encryptDllPayload(ne.getValue(), dllEncKey)
+                            : ne.getValue();
+                    resources.put(ne.getKey(), payload);
+                }
+            }
         }
 
         // Shuffle resource order slightly when writing JAR so real vs junk entries mix naturally
@@ -394,7 +481,10 @@ public final class JarProcessor implements Opcodes {
     }
 
     private static boolean shouldIncludeClass(ClassNode cn, FabricMetadata meta, ObfuscationConfig config) {
-        if ((cn.access & ACC_ANNOTATION) != 0) return false;
+        if ((cn.access & (ACC_ANNOTATION | ACC_MODULE)) != 0) return false;
+        if ("module-info".equals(cn.name) || "package-info".equals(cn.name) || cn.name.endsWith("/package-info")) {
+            return false;
+        }
         if (cn.name.startsWith("dev/neuro/nativeobfuscator/")
                 || cn.name.startsWith("by/radioegor146/nativeobfuscator/")) {
             return false;
@@ -403,6 +493,7 @@ public final class JarProcessor implements Opcodes {
     }
 
     private static boolean isEligibleMethod(ClassNode cn, MethodNode mn, Set<MethodNode> nonNativeHelpers) {
+        if ((cn.access & ACC_INTERFACE) != 0) return false;
         if (nonNativeHelpers.contains(mn)) return false;
         if ("<init>".equals(mn.name) || "<clinit>".equals(mn.name)) return false;
         if ((mn.access & (ACC_ABSTRACT | ACC_NATIVE)) != 0) return false;
@@ -410,8 +501,91 @@ public final class JarProcessor implements Opcodes {
         return true;
     }
 
+    private static Set<String> computeStartupStayClasses(
+            Map<String, ClassNode> classes,
+            FabricMetadata fabricMeta,
+            JarMetadata jarMeta,
+            Set<String> mixinTargets,
+            Set<ClassNode> targetClasses) {
+
+        Set<String> seeds = new LinkedHashSet<>();
+        seeds.addAll(fabricMeta.getEntrypointClasses());
+        for (ClassNode cn : classes.values()) {
+            if (MixinOutliner.isMixinClass(cn, fabricMeta)) seeds.add(cn.name);
+        }
+        seeds.addAll(mixinTargets);
+        seeds.addAll(jarMeta.getEntrypointClasses());
+        seeds.addAll(jarMeta.getSpiClasses());
+
+        // Plain library JAR (no Fabric mod metadata and no Main-Class / Agent entrypoint):
+        // external callers can touch any public top-level class before HLoader initializes.
+        if (!fabricMeta.isFabricMod() && jarMeta.getEntrypointClasses().isEmpty()) {
+            for (ClassNode cn : classes.values()) {
+                if ((cn.access & ACC_PUBLIC) != 0 && !cn.name.contains("$")) {
+                    seeds.add(cn.name);
+                }
+            }
+        }
+
+        // Propagate transitive superclasses/interfaces/nest-hosts/enclosing-classes of stay classes,
+        // because JVM resolves supers/interfaces BEFORE executing <clinit> (where HLoader unpacks .fucked).
+        Set<String> closure = new LinkedHashSet<>();
+        ArrayDeque<String> queue = new ArrayDeque<>(seeds);
+        while (!queue.isEmpty()) {
+            String cur = queue.poll();
+            if (cur == null || !closure.add(cur)) continue;
+            ClassNode cn = classes.get(cur);
+            if (cn == null) continue;
+            if (cn.superName != null && classes.containsKey(cn.superName)) queue.add(cn.superName);
+            if (cn.interfaces != null) {
+                for (String itf : cn.interfaces) {
+                    if (classes.containsKey(itf)) queue.add(itf);
+                }
+            }
+            if (cn.nestHostClass != null && classes.containsKey(cn.nestHostClass)) queue.add(cn.nestHostClass);
+            int dollar = cn.name.lastIndexOf('$');
+            if (dollar > 0) {
+                String outer = cn.name.substring(0, dollar);
+                if (classes.containsKey(outer)) queue.add(outer);
+            }
+        }
+        return closure;
+    }
+
+    private static boolean needsStartupBootHook(
+            ClassNode cn,
+            FabricMetadata fabricMeta,
+            JarMetadata jarMeta,
+            Set<String> startupStayClasses) {
+        if ((cn.access & (ACC_INTERFACE | ACC_ANNOTATION | ACC_MODULE)) != 0) return false;
+        if ("module-info".equals(cn.name) || "package-info".equals(cn.name) || cn.name.endsWith("/package-info")) {
+            return false;
+        }
+        if (fabricMeta.getEntrypointClasses().contains(cn.name) || jarMeta.getEntrypointClasses().contains(cn.name)) {
+            return true;
+        }
+        // In Library JAR mode, any public API entry stub needs to trigger HLoader if it had no native methods itself
+        return !fabricMeta.isFabricMod()
+                && jarMeta.getEntrypointClasses().isEmpty()
+                && startupStayClasses.contains(cn.name)
+                && (cn.access & ACC_PUBLIC) != 0
+                && !cn.name.contains("$");
+    }
+
+    private static boolean isJarSignatureFile(String name) {
+        if (!name.startsWith("META-INF/")) return false;
+        String up = name.toUpperCase(Locale.ROOT);
+        return up.endsWith(".SF") || up.endsWith(".DSA") || up.endsWith(".RSA") || up.endsWith(".EC");
+    }
+
+    private static byte[] ensureManifestTrailingNewline(byte[] raw) {
+        if (raw.length == 0 || raw[raw.length - 1] == '\n') return raw;
+        byte[] copy = Arrays.copyOf(raw, raw.length + 1);
+        copy[raw.length] = '\n';
+        return copy;
+    }
+
     private static boolean shouldUseVm(ClassNode cn, MethodNode mn, MixinOutliner.MixinContext mCtx, ObfuscationConfig config) {
-        if (mCtx != null) return false;
         if (AnnotationFilter.shouldUseVm(cn, mn)) return true;
         String full = cn.name + "." + mn.name;
         for (String exc : config.getVmExcludePatterns()) {
@@ -423,7 +597,7 @@ public final class JarProcessor implements Opcodes {
         if (config.getTier() == ObfuscationConfig.ProtectionTier.ULTRA) {
             int realInsns = 0;
             for (var insn : mn.instructions) if (insn.getOpcode() >= 0) realInsns++;
-            return realInsns >= 6 && realInsns <= 1500;
+            return realInsns >= 1 && realInsns <= 2500;
         }
         return false;
     }
@@ -436,19 +610,13 @@ public final class JarProcessor implements Opcodes {
         return bos.toByteArray();
     }
 
-    private static long fnvUpdate(long h, byte[] data) {
-        for (byte b : data) {
-            h ^= (b & 0xFFL);
-            h *= 0x100000001B3L;
-        }
-        return h;
-    }
-
     private static void writeJar(Path outPath, Map<String, byte[]> resources, Map<String, byte[]> classes, Random rng) throws IOException {
         if (outPath.getParent() != null) Files.createDirectories(outPath.getParent());
+        Set<String> written = new HashSet<>();
         try (JarOutputStream jos = new JarOutputStream(Files.newOutputStream(outPath))) {
             byte[] mf = resources.get("META-INF/MANIFEST.MF");
             if (mf != null) {
+                written.add("META-INF/MANIFEST.MF");
                 jos.putNextEntry(new ZipEntry("META-INF/MANIFEST.MF"));
                 jos.write(mf);
                 jos.closeEntry();
@@ -461,6 +629,7 @@ public final class JarProcessor implements Opcodes {
             mixed.addAll(classes.entrySet());
             Collections.shuffle(mixed, rng);
             for (Map.Entry<String, byte[]> e : mixed) {
+                if (!written.add(e.getKey())) continue;
                 jos.putNextEntry(new ZipEntry(e.getKey()));
                 jos.write(e.getValue());
                 jos.closeEntry();
@@ -478,5 +647,27 @@ public final class JarProcessor implements Opcodes {
                 }
             }
         } catch (IOException ignored) {}
+    }
+
+    private static String escJson(String s) {
+        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private static void registerBuildOnServer(String serverUrl, String adminToken, String jsonBody) throws Exception {
+        String base = serverUrl.endsWith("/") ? serverUrl.substring(0, serverUrl.length() - 1) : serverUrl;
+        var client = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds(5))
+                .build();
+        var req = java.net.http.HttpRequest.newBuilder(java.net.URI.create(base + "/api/v1/admin/builds"))
+                .timeout(java.time.Duration.ofSeconds(10))
+                .header("Content-Type", "application/json")
+                .header("X-Admin-Token", adminToken)
+                .POST(java.net.http.HttpRequest.BodyPublishers.ofString(jsonBody))
+                .build();
+        var resp = client.send(req, java.net.http.HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw new IllegalStateException("Failed to register build on server (" + resp.statusCode() + "): " + resp.body());
+        }
+        System.out.println("[HydroJ2C] Build manifest registered on server: " + base);
     }
 }

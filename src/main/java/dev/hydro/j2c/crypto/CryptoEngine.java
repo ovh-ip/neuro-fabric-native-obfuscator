@@ -10,15 +10,72 @@ import java.util.Random;
 public final class CryptoEngine {
 
     private final long masterSeed;
+    private final long sealMagic;
+    private final long hashBasis;
+    private final long hashPrime;
+    private final long tagSalt;
     private final Random rng;
 
     public CryptoEngine(long masterSeed) {
         this.masterSeed = masterSeed;
         this.rng = new Random(masterSeed ^ 0x9E3779B97F4A7C15L);
+        long sm;
+        do {
+            sm = rng.nextLong() | 1L;
+        } while (sm == 0L || sm == 0x485944524F534541L);
+        this.sealMagic = sm;
+        this.hashBasis = (rng.nextLong() ^ 0x6A09E667F3BCC909L) | 1L;
+        this.hashPrime = ((rng.nextLong() & 0x0000FFFFFFFFFFFFL) ^ 0x0100000001B3L) | 3L;
+        this.tagSalt = rng.nextLong() ^ 0xBB67AE8584CAA73BL;
     }
 
     public long getMasterSeed() {
         return masterSeed;
+    }
+
+    public long getSealMagic() {
+        return sealMagic;
+    }
+
+    public long getHashBasis() {
+        return hashBasis;
+    }
+
+    public long getHashPrime() {
+        return hashPrime;
+    }
+
+    public long getTagSalt() {
+        return tagSalt;
+    }
+
+    public long hash64Update(long h, byte[] data) {
+        for (byte b : data) {
+            h ^= (b & 0xFFL);
+            h *= hashPrime;
+        }
+        return h;
+    }
+
+    public long hash64(byte[] data) {
+        return hash64Update(hashBasis, data);
+    }
+
+    /**
+     * Emits an MBA-obfuscated 64-bit constant anchored to a caller-supplied runtime expression `opVar`.
+     */
+    public String mbaConst64WithVar(long value, String opVar, boolean strong) {
+        if (!strong) {
+            long k = rng.nextLong();
+            long e = value ^ k;
+            return "((uint64_t)((" + hex64(e) + "ULL ^ " + hex64(k) + "ULL) ^ (" + opVar + " ^ " + opVar + ")))";
+        }
+        long r1 = rng.nextLong();
+        long target = value ^ r1;
+        long a = rng.nextLong();
+        long b = target - a;
+        String z = "((((" + opVar + " * (" + opVar + " + 1ULL)) & 1ULL) != 0ULL) ? " + hex64(rng.nextLong()) + "ULL : 0ULL)";
+        return "((uint64_t)(((" + hex64(a ^ b) + "ULL + (" + hex64(a & b) + "ULL << 1)) ^ " + hex64(r1) + "ULL) ^ " + z + "))";
     }
 
     public static long splitMix64(long z) {

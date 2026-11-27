@@ -8,7 +8,7 @@ import java.nio.file.Path;
 import java.util.List;
 
 /**
- * CLI entrypoint for HydroJ2C — Native Java-to-C++ (.dll) + Encrypted VM Protector for Minecraft Fabric Mods.
+ * CLI entrypoint for HydroJ2C — Native Java-to-C++ (.dll) + Encrypted VM Protector for Java JARs & Fabric Mods.
  */
 public final class Main {
 
@@ -49,10 +49,22 @@ public final class Main {
                 case "--no-anti-debug" -> cfg.setAntiDebug(false);
                 case "--no-anti-dump" -> cfg.setAntiDump(false);
                 case "--no-anti-tamper" -> cfg.setAntiTamper(false);
-                case "--jobs", "-j" -> cfg.setCompileJobs(Integer.parseInt(nextArg(args, ++i, a)));
+                case "-j", "--jobs" -> cfg.setCompileJobs(Integer.parseInt(nextArg(args, ++i, a)));
+                case "--cmake" -> cfg.setBuildWithCmake(true);
+                case "--cmake-out", "--keep-cmake" -> cfg.setCmakeOutDir(Path.of(nextArg(args, ++i, a)));
+                case "--natives-dir" -> cfg.setPrebuiltNativesDir(Path.of(nextArg(args, ++i, a)));
                 case "--jdk" -> cfg.setJdkHome(Path.of(nextArg(args, ++i, a)));
                 case "--compiler" -> cfg.setCompilerPath(nextArg(args, ++i, a));
                 case "--seed" -> cfg.setSeed(Long.decode(nextArg(args, ++i, a)));
+                case "--server-url" -> cfg.setServerUrl(nextArg(args, ++i, a));
+                case "--server-pubkey" -> cfg.setServerPubKeyHex(nextArg(args, ++i, a));
+                case "--product-id" -> cfg.setProductId(nextArg(args, ++i, a));
+                case "--build-id" -> cfg.setBuildId(nextArg(args, ++i, a));
+                case "--server-key-file" -> cfg.setServerKeyFile(nextArg(args, ++i, a));
+                case "--license-key" -> cfg.setBakedLicenseKey(nextArg(args, ++i, a));
+                case "--manifest-out" -> cfg.setManifestOut(Path.of(nextArg(args, ++i, a)));
+                case "--server-admin-token" -> cfg.setServerAdminToken(nextArg(args, ++i, a));
+                case "--server-heartbeat-sec" -> cfg.setServerHeartbeatSec(Integer.parseInt(nextArg(args, ++i, a)));
                 case "-h", "--help" -> { printUsage(); return; }
                 default -> {
                     if (cfg.getInputJar() == null && !a.startsWith("-")) {
@@ -113,16 +125,16 @@ public final class Main {
 
     private static void printUsage() {
         System.out.println("""
-                HydroJ2C — Minecraft Fabric J2C Native (.dll) & Encrypted VM Obfuscator
+                HydroJ2C — Native Java-to-C++ (.dll) & Encrypted VM Protector (Standard JARs & Fabric Mods)
                 Usage:
-                  hydro -i <input-mod.jar> [-o <output-mod.jar>] [-d <output.dll>] [options]
+                  hydro -i <input.jar> [-o <output-protected.jar>] [-d <output.dll>] [options]
 
                 Options:
                   -a, --annotations            Process only @Native classes/methods (and respect @NotNative / @NativeVM)
                   -w, --white-list <file>      Read whitelist class/method patterns from file
                   -b, --black-list <file>      Read blacklist class/method patterns from file
                   --tier <FAST|STRONG|ULTRA>   Protection level (default: STRONG; ULTRA adds Native VM)
-                  --include <glob>             Class/package glob (auto-detected from fabric.mod.json if omitted)
+                  --include <glob>             Class/package glob (auto-detects Fabric packages, or protects all classes in standard JARs)
                   --exclude <glob>             Exclude class/package glob
                   --vm <glob>                  Force matching classes/methods into randomized Native VM
                   --vm-exclude <glob>          Keep matching classes/methods in fast CFF native C++ instead of VM
@@ -136,10 +148,22 @@ public final class Main {
                   --no-anti-debug              Disable PEB/NtQuery/DrX anti-debug checks
                   --no-anti-dump               Disable JNI vtable hook & anti-dump checks
                   --no-anti-tamper             Disable DLL & JAR integrity verification
+                  --cmake                      Build host native library via generated CMake project
+                  --cmake-out <dir>            Export cross-platform CMake C++20 project (Win/Linux/macOS, x86/ARM)
+                  --natives-dir <dir>          Bundle prebuilt .dll/.so/.dylib libraries into JAR natives/<os>-<arch>/
                   -j, --jobs <N>               Parallel C++ compile jobs
                   --jdk <path>                 Path to JDK with jni.h
                   --compiler <path>            Path to g++/clang++
                   --seed <hex/int>             Deterministic build seed
+                  --server-url <url>           Bind runtime/vault/VM secrets to Spring licensing server
+                  --server-pubkey <64-hex>     Pinned X25519 server public key from Spring server startup
+                  --product-id <id>            Product identifier registered on server
+                  --build-id <id>              Override build identifier registered on server
+                  --server-key-file <path>     Local file holding license key (default: hydro.key)
+                  --license-key <key>          Optional baked license key for private builds
+                  --manifest-out <path>        Where to save <output>-server.json build secret bundle
+                  --server-admin-token <tok>   Auto-register protected build onto Spring server via Admin API
+                  --server-heartbeat-sec <N>   Native rolling session heartbeat period in seconds
                 """);
     }
 }

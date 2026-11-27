@@ -1,139 +1,153 @@
-# neuro-fabric-native-obfuscator
+# HydroJ2C — Нативный Java-to-C++ обфускатор, полиморфная VM и сервер динамических сессий
 
-Нативный **Java-to-C++ (J2C -> `.dll`)** обфускатор и гибридный протектор с полиморфной зашифрованной **Native VM**, разработанный специально для модов **Minecraft Fabric**.
-
-Переносит Java-байткод в нативную Windows x64 `.dll`, шифрует классы в `.fucked` с нативной подгрузкой через JNI `DefineClass`, встраивает DLL прямо в папку `natives/` внутри мода и маскирует структуру архива сотнями мусорных классов и папок.
+**HydroJ2C** — кроссплатформенный протектор Java-байткода (стандартные runnable/library JAR-файлы и моды Fabric/Mixin), компилирующий бизнес-логику в нативные библиотеки (`.dll` / `.so` / `.dylib`) на C++20 и защищающий нативный бинарник от статического и динамического реверс-инжиниринга.
 
 ---
 
-## Основные возможности
+## Ключевые возможности
 
-### Нативная компиляция и VM
-- **Java -> C++20 -> Windows x64 `.dll`**: преобразование методов, конструкторов (тело после `super(...)`), `<clinit>`, лямбд (`invokedynamic`), `StringConcatFactory` и `record` в нативный код.
-- **Control-Flow Flattening (CFF) + MBA + Opaque Predicates**:
-  - разбиение кода на перемешанные базовые блоки с нелинейной state-машиной;
-  - Mixed Boolean-Arithmetic (MBA) синтез констант и арифметики, привязанный к `volatile` runtime-энтропии;
-  - ложные (bogus) мёртвые ветки и непрозрачные предикаты.
-- **Полиморфная зашифрованная Native VM (`--tier ULTRA` / `--vm`)**:
-  - уникальная перестановка 256 опкодов при каждой сборке;
-  - шифрование байткода потоковым ключом (`SplitMix64`);
-  - собственный стеково-слотовый интерпретатор внутри `.dll` с поддержкой исключений и `RefTable`.
-- **Zero-Export `RegisterNatives`**: `.dll` экспортирует **только `JNI_OnLoad`** — в таблице экспортов нет ни одного `Java_*` символа.
-- **Bit-Exact Intrinsics & `RefTable`**: быстрые интринсики для `Math.*`, `Integer.*`, `Long.*`, `Float.*`, `Double.*` без лишних JNI-вызовов и безопасное управление `LocalRef` с подсчётом ссылок для длинных игровых циклов.
+### 1. Обфускация байткода и C++20 кодогенерация
+- **Поддержка любых JAR-целей:**
+  - Автоматическое определение и изоляция **Fabric-модов** (`fabric.mod.json` entrypoints, 1-строчный `@Mixin`-трамплин).
+  - **Стандартные runnable JAR** (`java -jar`, `Main-Class`), **library JAR** на multi-JAR classpath, а также точечный режим `-a / --annotations` (`@Native`, `@NativeVM`, `@NotNative`).
+- **Три уровня защиты (`--tier`):**
+  - `FAST` — базовая трансляция критичных методов + шифрование констант.
+  - `STRONG` — Control Flow Flattening (`CFF`), Mixed Boolean-Arithmetic (`MBA`), opaque predicates, обфускация строкового/классового пула и шифрование классов в `.fucked` + декойные `.class`/`.fucked`.
+  - `ULTRA` — полиморфная **Native VM** со случайной перестановкой опкодов на каждую сборку и **разреженной 32-битной биективной диспетчеризацией** (`(op * dispMul) ^ dispXor`), ломающей восстановление jump-таблиц в декомпиляторах.
+- **Кроссплатформенность (CMake + Multi-OS JAR):**
+  - Генерация готового **CMake C++20 проекта** (`--cmake`, `--cmake-out <dir>`) под Windows / Linux / macOS (`x86_64`, `ARM64`, `x86`).
+  - Автоматическая упаковка нативов (`--natives-dir <dir>`) внутрь `natives/<os>-<arch>/` (опционально с шифрованием `--encrypt-dll`) или работа с внешней библиотекой (`--external-dll`).
 
-### Интеграция с Minecraft Fabric
-- **Авторазбор `fabric.mod.json` и `*.mixins.json`**: автоматическое определение пакетов мода и сохранение контрактов entrypoints и Mixin.
-- **Безопасная защита `@Mixin` (`MixinOutliner`)**: хуки `@Inject`, `@Overwrite`, `@Redirect`, `@Modify*` выносятся в нативный bridge-класс внутри `.dll` с динамическим разрешением `@Shadow`-полей и методов на целевом классе, а в `@Mixin` остаётся минимальный трамплин, совместимый со SpongePowered Mixin.
-- **Поддержка `KnotClassLoader`**: разрешение классов работает через `FindClass` с автоматическим fallback на `Class.forName(..., true, modLoader)`.
-- **Встроенная папка `natives/`**: готовая `.dll` упаковывается в `natives/<name>.dll` прямо внутри итогового `.jar` и автоматически загружается при старте мода без дополнительных флагов JVM.
+### 2. Модульный нативный рантайм C++20 (`src/main/resources/native/`)
+- `hydro_runtime.hpp`, `hydro_crypto.hpp` — общие структуры, типы и примитивы.
+- `hydro_memory.cpp` — аллокаторы, obfuscated pointer cookies (`g_ptr_cookie`), безопасное затирание памяти.
+- `hydro_crypto.cpp` — **X25519**, **ChaCha20**, **HMAC-SHA256**, **HKDF-SHA256**, CSPRNG (`BCryptGenRandom` через динамический экспорт без статического импорта / `/dev/urandom`).
+- `hydro_security.cpp` — анти-отладка и анти-тампер:
+  - Обход PEB + хэш-резолвинг WinAPI (`FNV-1a`) с поддержкой PE export forwarders — минимальная таблица импортов без строк API в `.rdata`.
+  - Детект отладчиков и инструментов анализа (`PEB`, `NtQueryInformationProcess`, аппаратные `Dr0..Dr3`, `TracerPid`, `sysctl`, поиск модулей `frida-agent.dll`, `frida-gadget.dll`, `x64dbg.dll`, `scyllahide.dll`, `vehdebug-x86_64.dll`).
+  - Скрытие рабочего heartbeat-потока от отладчика (`NtSetInformationThread` / `ThreadHideFromDebugger`).
+  - Самопроверка целостности секции `.text` (`VirtualQuery` + хэш секции кода), детектор inline-хуков (`0xCC`/`0xE9`/`JMP`/`BRK`) и проверка печати таблицы символов `g_hydro_seal_box`.
+- `hydro_net.cpp` — клиентский протокол лицензирования и rolling heartbeat (полностью исключается из сборки при отключённом `--server-url`, а при включённом использует динамическую загрузку `winhttp.dll`/`advapi32.dll` и зашифрованные строки).
+- `hydro_jni_bridge.cpp` — единый экспорт `JNI_OnLoad`, динамическая регистрация методов через `RegisterNatives`, верификация JAR/ресурсов и загрузка `.fucked` через `DefineClass`.
+- `hydro_vm_core.cpp` — стековая нативная ВМ с шифрованным байткодом, периодическим guard-чеком и проверкой активной сессии.
+- `NativeCompiler` — автоматическое зануление временных меток PE (`COFF TimeDateStamp`, `ExportDirectory`, `DebugDirectory`).
 
-### Защита архива и самозащита
-- **Шифрование классов в `.fucked`**: классы логики и Mixin-мосты удаляются как `.class`, шифруются без заголовка (индивидуальный ключ + FNV-1a-64 MAC) и прячутся в случайных путях `.fucked`. Расшифровка и загрузка через JNI `DefineClass` выполняются только внутри `.dll` с последующим затиранием памяти (`secure_wipe`).
-- **Мусорные классы и папки (`--junk`)**: генерация десятков глубоко вложенных фейковых пакетов с валидными мусорными `.class` (switch, try/catch, фейковые строки и native-заглушки) и неотличимыми по энтропии `.fucked`-пустышками.
-- **Шифрованное хранилище символов и строк**: имена классов, методов, полей, дескрипторы и UTF-16 строковые литералы зашифрованы в `.dll`, расшифровываются на стеке и немедленно затираются; кэши `jclass`/`jmethodID`/`jfieldID` замаскированы runtime cookie.
-- **Anti-Debug / Anti-Dump / Anti-Hook / Anti-Tamper**:
-  - динамический поиск Win32 API через PEB (`InMemoryOrderModuleList` + FNV-1a экспорты, без явных импортов `IsDebuggerPresent` / `NtQueryInformationProcess`);
-  - проверки PEB (`BeingDebugged`, `NtGlobalFlag`, флаги `jdwp` в командной строке), `NtQueryInformationProcess`, аппаратных точек останова (`Dr0..Dr3`);
-  - проверка JNI-таблицы на перехват за пределами `jvm.dll`, а также проверка целостности таблицы символов `.dll` и ресурсов внутри `.jar`.
-
----
-
-## Требования
-
-- **Windows x64**
-- **JDK 21+** (с `include/jni.h` и `include/win32/jni_md.h`)
-- **MinGW-W64 `g++` (UCRT x86_64, C++20)** в `PATH` (или указанный через `--compiler`)
+### 3. Spring Boot сервер лицензий и динамических сессий (`server/`)
+Сервер (`Java 21`, `Spring Boot 3.5.0`, `Spring Data JPA`, `H2`) привязывает нативный код к активной онлайн-сессии так, что без валидной лицензии клиент не может расшифровать ключи VM и vault:
+- **Split-secret архитектура:** во время сборки `HydroJ2C` отделяет `serverVmShare` и `serverVaultShare` в манифест `<output>-server.json` (или сразу регистрирует на сервере через `--server-admin-token`). В клиентский JAR/DLL эти доли не попадают.
+- **Сквозная криптография:** взаимный **X25519** (статический ключ сервера + эфемерные ключи), деривация через **HKDF-SHA256**, шифрование ответа **ChaCha20** и аутентификация **HMAC-SHA256**.
+- **HWID-привязка и Rolling Heartbeat:** вычисление аппаратного ID нативного уровня, периодическая ротация `rollingKey` на каждом heartbeat, автоматический отзыв сессии по таймауту lease.
+- **Мгновенный live-бан:** отзыв лицензии или билда админ-запросом мгновенно обрывает активные клиенты на следующем heartbeat / проверке VM.
 
 ---
 
 ## Быстрый старт
 
-### 1. Сборка и запуск автотестов
+### 1. Сборка и полный прогон тестов (Windows / PowerShell)
+Требуются JDK 21+ (`javac`, `jar`, `javap`) и `g++` (MinGW-w64) или `clang++` в `PATH`:
+
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File hydro.ps1 test
-```
-Скрипт скомпилирует протектор в `build\hydro-j2c.jar`, соберёт тестовый Fabric-мод, прогонит защиту в режимах `STRONG` и `ULTRA`, проверит таблицу экспортов `.dll`, структуру `natives/` и `.fucked` и выполнит проверку в изолированном `ClassLoader` с симуляцией Mixin и тестом Anti-Tamper.
+# Сборка протектора build\hydro-j2c.jar
+powershell -ExecutionPolicy Bypass -File .\hydro.ps1 build
 
-### 2. Сборка fat JAR и библиотеки аннотаций
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File hydro.ps1 build
-```
-После сборки появятся:
-- `build\hydro-j2c.jar` — сам протектор;
-- `build\neuro-annotations.jar` — аннотации `@Native`, `@NotNative`, `@NativeVM` для подключения в мод (`compileOnly`).
-
-### 3. Защита Fabric-мода
-
-**Режим аннотаций (`-a` / `--annotations`, как в `native-obfuscator`)** — в `.dll` уйдут только классы и методы с `@Native` / `@NativeVM` (включая их лямбды и `@Mixin`-хуки), остальной код останется нетронутым Java-байткодом:
-```java
-import dev.neuro.nativeobfuscator.Native;
-import dev.neuro.nativeobfuscator.NotNative;
-import dev.neuro.nativeobfuscator.NativeVM;
-
-@Native
-public class AuthManager {
-    public boolean checkLicense(String key) { ... } // уйдёт в .dll как CFF+MBA native
-
-    @NativeVM
-    public byte[] decryptPayload(byte[] data) { ... } // уйдёт в полиморфную Native VM
-
-    @NotNative
-    public String getVersion() { return "1.0"; } // останется в Java
-}
-```
-> Поддерживаются также аннотации `by.radioegor146.nativeobfuscator.Native` и `NotNative` — в итоговом JAR все маркеры аннотаций автоматически вычищаются.
-
-Запуск с `-a`:
-```powershell
-java -jar build\hydro-j2c.jar -a -i my-mod.jar -o my-mod-protected.jar --tier STRONG
+# Полный E2E прогон: Fabric-мод, Runnable JAR, Library JAR, CMake-сборка,
+# Spring Boot сервер (X25519 + ChaCha20 + rolling heartbeat + live revoke) и аудит DLL
+powershell -ExecutionPolicy Bypass -File .\hydro.ps1 test
 ```
 
-**Полная защита всего мода (`STRONG`)** (без `-a`, максимальная производительность CFF + MBA + Opaque Predicates, `.fucked`-классы, `natives/*.dll` внутри JAR):
+### 2. Защита JAR без сервера
 ```powershell
-java -jar build\hydro-j2c.jar -i my-mod.jar -o my-mod-protected.jar --tier STRONG
+# Максимальный уровень (STRONG) с автодетектом классов мода или приложения
+java -jar build\hydro-j2c.jar -i app.jar -o app-protected.jar --tier STRONG
+
+# Режим ULTRA (CFF+MBA + Native VM) + экспорт кроссплатформенного CMake-проекта
+java -jar build\hydro-j2c.jar -i app.jar -o app-ultra.jar --tier ULTRA --cmake --cmake-out build\cmake-proj
 ```
 
-**Режим `ULTRA`** (CFF+MBA + полиморфная Native VM для выбранных или всех подходящих методов):
+### 3. Сборка с сервером лицензий (`server/`)
+1. Соберите и запустите Spring Boot сервер:
 ```powershell
-java -jar build\hydro-j2c.jar -i my-mod.jar -o my-mod-protected.jar --tier ULTRA --vm "com/example/auth/**" --vm-exclude "com/example/render/**"
+cd server
+gradle bootRun
+```
+При первом запуске сервер создаст `./data/server-keys.json` и выведет `serverPubHex` (через `/api/v1/health`) и `adminToken`.
+
+2. Защитите JAR с привязкой к серверу и авто-регистрацией билда:
+```powershell
+java -jar build\hydro-j2c.jar `
+  -i app.jar -o app-srv.jar --tier ULTRA `
+  --server-url http://127.0.0.1:8080 `
+  --server-pubkey <64-hex-pubkey> `
+  --product-id my-product `
+  --server-admin-token <admin-token> `
+  --server-heartbeat-sec 15
+```
+
+3. Выпустите лицензию и запустите защищённый JAR с ключом `-Dhydro.key=...` (либо через переменную окружения `HYDRO_LICENSE_KEY` / файл `hydro.key`):
+```powershell
+java -Dhydro.key=HY-YOUR-LICENSE-KEY -jar app-srv.jar
 ```
 
 ---
 
 ## Параметры CLI
 
-| Параметр | Описание | По умолчанию |
-|---|---|---|
-| `-i, --input <jar>` | Входной `.jar` файл мода | Обязательно |
-| `-o, --output <jar>` | Выходной защищённый `.jar` | `<name>-protected.jar` |
-| `-d, --dll <dll>` | Путь для сохранения `.dll` на диск | Рядом с выходным JAR |
-| `-a, --annotations` | Переносить в `.dll` только `@Native` / `@NativeVM` (учитывать `@NotNative`) | Выкл (защищаются все классы мода) |
-| `-w, --white-list <file>` | Whitelist файл со списком классов/масок | — |
-| `-b, --black-list <file>` | Blacklist файл со списком исключений | — |
-| `--tier <FAST\|STRONG\|ULTRA>` | Уровень защиты (`ULTRA` включает Native VM) | `STRONG` |
-| `--include <glob>` | Маска включаемых классов/пакетов | Авто из `fabric.mod.json` |
-| `--exclude <glob>` | Маска исключаемых классов/пакетов | — |
-| `--vm <glob>` | Принудительно поместить классы/методы в Native VM | — |
-| `--vm-exclude <glob>` | Оставить классы/методы в быстром CFF C++ вместо VM | — |
-| `--junk <N>` | Количество мусорных `.class` и `.fucked` файлов | `300` |
-| `--no-junk` | Отключить генерацию мусора | — |
-| `--no-fucked` | Не шифровать классы в `.fucked` | — |
-| `--external-dll [path]` | Загружать внешнюю `.dll` с диска вместо `natives/` | Выкл (используется `natives/`) |
-| `--encrypt-dll` | Дополнительно шифровать `.dll` внутри `natives/` | Выкл |
-| `--no-mixins` | Отключить авто-вынос `@Mixin` хуков | Выкл |
-| `--no-ctor-outline` | Отключить вынос тела `<init>` / `<clinit>` | Выкл |
-| `--no-anti-debug` | Отключить анти-отладку | Выкл |
-| `--no-anti-dump` | Отключить анти-дамп / проверку JNI vtable | Выкл |
-| `--no-anti-tamper` | Отключить проверку целостности `.dll` и `.jar` | Выкл |
-| `-j, --jobs <N>` | Количество потоков компиляции C++ | По числу ядер CPU |
-| `--jdk <path>` | Путь к JDK с `jni.h` | Автопоиск |
-| `--compiler <path>` | Путь к `g++` | `g++` |
-| `--seed <num>` | Фиксированный seed генерации | Случайный |
+```text
+Usage:
+  hydro -i <input.jar> [-o <output-protected.jar>] [-d <output.dll>] [options]
+
+Options:
+  -a, --annotations            Process only @Native classes/methods (and respect @NotNative / @NativeVM)
+  -w, --white-list <file>      Read whitelist class/method patterns from file
+  -b, --black-list <file>      Read blacklist class/method patterns from file
+  --tier <FAST|STRONG|ULTRA>   Protection level (default: STRONG; ULTRA adds Native VM)
+  --include <glob>             Class/package glob (auto-detects Fabric packages, or protects all classes in standard JARs)
+  --exclude <glob>             Exclude class/package glob
+  --vm <glob>                  Force matching classes/methods into randomized Native VM
+  --vm-exclude <glob>          Keep matching classes/methods in fast CFF native C++ instead of VM
+  --external-dll [path]        Load external .dll instead of embedding inside JAR natives/
+  --encrypt-dll                Also encrypt the DLL payload inside natives/
+  --junk <N>                   Generate N decoy .class & .fucked files in nested junk folders (default: 300)
+  --no-junk                    Disable junk classes/folders
+  --no-fucked                  Keep protected stub classes as .class instead of encrypted .fucked
+  --no-mixins                  Disable automatic @Mixin hook outlining
+  --no-ctor-outline            Disable <init> body outlining
+  --no-anti-debug              Disable PEB/NtQuery/DrX anti-debug checks
+  --no-anti-dump               Disable JNI vtable hook & anti-dump checks
+  --no-anti-tamper             Disable DLL & JAR integrity verification
+  --cmake                      Build host native library via generated CMake project
+  --cmake-out <dir>            Export cross-platform CMake C++20 project (Win/Linux/macOS, x86/ARM)
+  --natives-dir <dir>          Bundle prebuilt .dll/.so/.dylib libraries into JAR natives/<os>-<arch>/
+  -j, --jobs <N>               Parallel C++ compile jobs
+  --jdk <path>                 Path to JDK with jni.h
+  --compiler <path>            Path to g++/clang++
+  --seed <hex/int>             Deterministic build seed
+  --server-url <url>           Bind runtime/vault/VM secrets to Spring licensing server
+  --server-pubkey <64-hex>     Pinned X25519 server public key from Spring server startup
+  --product-id <id>            Product identifier registered on server
+  --build-id <id>              Override build identifier registered on server
+  --server-key-file <path>     Local file holding license key (default: hydro.key)
+  --license-key <key>          Optional baked license key for private builds
+  --manifest-out <path>        Where to save <output>-server.json build secret bundle
+  --server-admin-token <tok>   Auto-register protected build onto Spring server via Admin API
+  --server-heartbeat-sec <N>   Native rolling session heartbeat period in seconds
+```
 
 ---
 
-## Важные примечания по совместимости с Fabric
+## REST API сервера (`server/`)
 
-- Классы, указанные в `fabric.mod.json` в секции `entrypoints`, остаются в `.class` как пустые нативные обёртки без бизнес-логики внутри байткода, чтобы Fabric Loader мог их инициализировать.
-- Классы `@Mixin` сохраняют 1-строчный трамплин, вызывающий нативный bridge-класс (который компилируется в `.dll` и шифруется в `.fucked`), благодаря чему SpongePowered Mixin корректно применяет трансформации.
-- Скомпилированная `.dll` нацелена на **Windows x64** (x86_64) и линкуется статически без зависимостей от `libstdc++-6.dll` или `libgcc_s_seh-1.dll`.
+Публичные эндпоинты клиента (`/api/v1`):
+- `GET /api/v1/health` — статус сервера и открытый ключ X25519 (`serverPubHex`).
+- `POST /api/v1/session/handshake` — X25519 + HKDF-SHA256 + HMAC handshake, возврат зашифрованных ChaCha20 долей `vmShare`/`vaultShare` и начального `rollingKey`.
+- `POST /api/v1/session/heartbeat` — периодическое подтверждение сессии с проверкой `symDigest`/`jarDigest`/`hwid` и ротацией `rollingKey`.
+- `POST /api/v1/session/logout` — завершение сессии.
+
+Админ-эндпоинты (`/api/v1/admin`, заголовок `X-Admin-Token`):
+- `POST /api/v1/admin/builds` — регистрация билда и секретных долей из манифеста.
+- `POST /api/v1/admin/builds/{productId}/{buildId}/revoke` — отзыв конкретного билда.
+- `POST /api/v1/admin/licenses` — выпуск лицензионного ключа (срок, лимит HWID, лимит одновременных сессий).
+- `POST /api/v1/admin/licenses/{key}/revoke` — мгновенная блокировка ключа и всех активных сессий.
+- `POST /api/v1/admin/licenses/{key}/reset-hwid` — сброс HWID-привязки.
+- `GET /api/v1/admin/sessions` — список активных сессий.
+- `GET /api/v1/admin/audit` — журнал событий безопасности и лицензирования.

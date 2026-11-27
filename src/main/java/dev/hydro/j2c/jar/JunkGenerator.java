@@ -14,7 +14,7 @@ import java.util.*;
  */
 public final class JunkGenerator implements Opcodes {
 
-    private static final String[] PKG_ROOTS = {
+    private static final String[] PKG_ROOTS_FABRIC = {
             "net/minecraft/internal",
             "org/spongepowered/cache",
             "com/mojang/auth/v3",
@@ -22,6 +22,17 @@ public final class JunkGenerator implements Opcodes {
             "dev/hydro/v4/impl",
             "net/fabricmc/loom/cache",
             "org/lwjgl/system/internal",
+            "com/google/common/reflect/stub"
+    };
+
+    private static final String[] PKG_ROOTS_JAVA = {
+            "com/sun/internal/stub",
+            "org/apache/commons/cache",
+            "javax/crypto/internal/v2",
+            "io/netty/channel/shadow",
+            "dev/hydro/v4/impl",
+            "org/slf4j/impl/bridge",
+            "com/fasterxml/core/cache",
             "com/google/common/reflect/stub"
     };
 
@@ -39,7 +50,23 @@ public final class JunkGenerator implements Opcodes {
             "Failed to map memory region",
             "Mixin refmap checksum error",
             "Key exchange aborted",
-            "Corrupt bytecode segment"
+            "Corrupt bytecode segment",
+            "PKCS5Padding integrity failed",
+            "TLS certificate pinning error",
+            "Native descriptor mismatch",
+            "Thread context drift detected",
+            "ClassLoader delegation violation",
+            "Buffer alignment check failed",
+            "Unexpected frame verification state",
+            "JNI local reference table exhausted",
+            "Symbol relocation offset invalid",
+            "HMAC digest mismatch",
+            "Protocol negotiation refused",
+            "Module descriptor digest invalid",
+            "Runtime pool lock timeout",
+            "Page guard fault ignored",
+            "Async dispatch queue full",
+            "Shadow field lookup deferred"
     };
 
     public static void populateJunk(
@@ -48,13 +75,36 @@ public final class JunkGenerator implements Opcodes {
             List<String> fuckedDirsOut,
             int totalJunkCount,
             Random rng) {
+        populateJunk(resources, realClassNames, fuckedDirsOut, totalJunkCount, true, V17, rng);
+    }
+
+    public static void populateJunk(
+            Map<String, byte[]> resources,
+            Set<String> realClassNames,
+            List<String> fuckedDirsOut,
+            int totalJunkCount,
+            boolean isFabricMod,
+            Random rng) {
+        populateJunk(resources, realClassNames, fuckedDirsOut, totalJunkCount, isFabricMod, V17, rng);
+    }
+
+    public static void populateJunk(
+            Map<String, byte[]> resources,
+            Set<String> realClassNames,
+            List<String> fuckedDirsOut,
+            int totalJunkCount,
+            boolean isFabricMod,
+            int classVersion,
+            Random rng) {
 
         if (totalJunkCount <= 0) return;
 
-        // Build 30+ deeply nested decoy directory paths
+        int safeClassVersion = Math.max(V1_8, classVersion);
+        String[] roots = isFabricMod ? PKG_ROOTS_FABRIC : PKG_ROOTS_JAVA;
+        // Build 36 deeply nested decoy directory paths
         List<String> dirs = new ArrayList<>();
         for (int i = 0; i < 36; i++) {
-            String root = PKG_ROOTS[rng.nextInt(PKG_ROOTS.length)];
+            String root = roots[rng.nextInt(roots.length)];
             int depth = 2 + rng.nextInt(4);
             StringBuilder dir = new StringBuilder(root);
             for (int d = 0; d < depth; d++) {
@@ -68,30 +118,30 @@ public final class JunkGenerator implements Opcodes {
         int decoyClassCount = totalJunkCount / 2;
         int decoyFuckedCount = totalJunkCount - decoyClassCount;
 
-        // 1. Valid realistic .class decoys
+        // 1. Valid realistic .class decoys matching dominant bytecode version & varied code patterns
         for (int i = 0; i < decoyClassCount; i++) {
             String dir = dirs.get(rng.nextInt(dirs.size()));
             String clsSimple = WORDS[rng.nextInt(WORDS.length)] + "_" + randomToken(rng, 6);
             String internalName = dir + "/" + clsSimple;
             if (realClassNames.contains(internalName) || resources.containsKey(internalName + ".class")) continue;
-            resources.put(internalName + ".class", buildDecoyClass(internalName, rng));
+            resources.put(internalName + ".class", buildDecoyClass(internalName, safeClassVersion, rng));
         }
 
-        // 2. Indistinguishable high-entropy .fucked decoy blobs (exact realistic 1KB-8KB size range)
+        // 2. Indistinguishable high-entropy .fucked decoy blobs spanning full range (256B..7.2KB)
         for (int i = 0; i < decoyFuckedCount; i++) {
             String dir = dirs.get(rng.nextInt(dirs.size()));
             String fname = randomToken(rng, 8 + rng.nextInt(8)) + ".fucked";
             String path = dir + "/" + fname;
             if (resources.containsKey(path)) continue;
-            byte[] noise = new byte[1024 + rng.nextInt(6144)];
+            byte[] noise = new byte[256 + rng.nextInt(6912)];
             rng.nextBytes(noise);
             resources.put(path, noise);
         }
     }
 
-    private static byte[] buildDecoyClass(String internalName, Random rng) {
+    private static byte[] buildDecoyClass(String internalName, int classVersion, Random rng) {
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
-        cw.visit(V17, ACC_PUBLIC | ACC_FINAL | ACC_SYNTHETIC, internalName, null, "java/lang/Object", null);
+        cw.visit(classVersion, ACC_PUBLIC | ACC_FINAL | ACC_SYNTHETIC, internalName, null, "java/lang/Object", null);
 
         String field1 = "f_" + randomToken(rng, 4);
         String field2 = "k_" + randomToken(rng, 4);
@@ -110,10 +160,12 @@ public final class JunkGenerator implements Opcodes {
         init.visitMaxs(2, 1);
         init.visitEnd();
 
-        // 2-4 realistic looking decoy methods with switches, loops, XOR math, and try/catch
+        // 2-4 varied decoy methods with switches, loops, bitwise mixing, and try/catch
         int mCount = 2 + rng.nextInt(3);
+        int templateKind = rng.nextInt(3);
         for (int m = 0; m < mCount; m++) {
             String mname = "m_" + randomToken(rng, 5);
+            int kind = (templateKind + m) % 3;
             MethodVisitor mv = cw.visitMethod(ACC_PUBLIC | ACC_STATIC, mname, "(II)J", null, null);
             mv.visitCode();
 
@@ -121,52 +173,105 @@ public final class JunkGenerator implements Opcodes {
             mv.visitTryCatchBlock(tStart, tEnd, tCatch, "java/lang/Throwable");
 
             mv.visitLabel(tStart);
-            mv.visitVarInsn(ILOAD, 0);
-            mv.visitLdcInsn(rng.nextInt());
-            mv.visitInsn(IXOR);
-            mv.visitVarInsn(ISTORE, 2);
+            if (kind == 1) {
+                // Counting mix loop decoy
+                mv.visitVarInsn(ILOAD, 0);
+                mv.visitInsn(I2L);
+                mv.visitLdcInsn(rng.nextLong());
+                mv.visitInsn(LXOR);
+                mv.visitVarInsn(LSTORE, 2);
+                mv.visitInsn(ICONST_0);
+                mv.visitVarInsn(ISTORE, 4);
+                Label lp = new Label(), le = new Label();
+                mv.visitJumpInsn(GOTO, le);
+                mv.visitLabel(lp);
+                mv.visitVarInsn(LLOAD, 2);
+                mv.visitLdcInsn(0x9E3779B97F4A7C15L);
+                mv.visitInsn(LMUL);
+                mv.visitVarInsn(ILOAD, 4);
+                mv.visitInsn(I2L);
+                mv.visitInsn(LXOR);
+                mv.visitVarInsn(LSTORE, 2);
+                mv.visitIincInsn(4, 1);
+                mv.visitLabel(le);
+                mv.visitVarInsn(ILOAD, 4);
+                mv.visitVarInsn(ILOAD, 1);
+                mv.visitIntInsn(BIPUSH, 7);
+                mv.visitInsn(IAND);
+                mv.visitJumpInsn(IF_ICMPLT, lp);
+                mv.visitVarInsn(LLOAD, 2);
+                mv.visitLabel(tEnd);
+                mv.visitInsn(LRETURN);
+            } else if (kind == 2) {
+                // Conditional branch + string hash decoy
+                mv.visitVarInsn(ILOAD, 0);
+                mv.visitVarInsn(ILOAD, 1);
+                mv.visitInsn(IXOR);
+                mv.visitInsn(ICONST_1);
+                mv.visitInsn(IAND);
+                Label lElse = new Label();
+                mv.visitJumpInsn(IFEQ, lElse);
+                mv.visitLdcInsn(DECOY_STRINGS[rng.nextInt(DECOY_STRINGS.length)]);
+                mv.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "length", "()I", false);
+                mv.visitInsn(I2L);
+                mv.visitLdcInsn(rng.nextLong());
+                mv.visitInsn(LXOR);
+                mv.visitInsn(LRETURN);
+                mv.visitLabel(lElse);
+                mv.visitVarInsn(ILOAD, 0);
+                mv.visitInsn(I2L);
+                mv.visitLdcInsn(0xBF58476D1CE4E5B9L);
+                mv.visitInsn(LMUL);
+                mv.visitLabel(tEnd);
+                mv.visitInsn(LRETURN);
+            } else {
+                mv.visitVarInsn(ILOAD, 0);
+                mv.visitLdcInsn(rng.nextInt());
+                mv.visitInsn(IXOR);
+                mv.visitVarInsn(ISTORE, 2);
 
-            Label l0 = new Label(), l1 = new Label(), l2 = new Label(), ld = new Label();
-            mv.visitVarInsn(ILOAD, 1);
-            mv.visitInsn(ICONST_3);
-            mv.visitInsn(IAND);
-            mv.visitTableSwitchInsn(0, 2, ld, l0, l1, l2);
+                Label l0 = new Label(), l1 = new Label(), l2 = new Label(), ld = new Label();
+                mv.visitVarInsn(ILOAD, 1);
+                mv.visitInsn(ICONST_3);
+                mv.visitInsn(IAND);
+                mv.visitTableSwitchInsn(0, 2, ld, l0, l1, l2);
 
-            mv.visitLabel(l0);
-            mv.visitVarInsn(ILOAD, 2);
-            mv.visitLdcInsn(0x45D9F3B);
-            mv.visitInsn(IMUL);
-            mv.visitInsn(I2L);
-            mv.visitInsn(LRETURN);
+                mv.visitLabel(l0);
+                mv.visitVarInsn(ILOAD, 2);
+                mv.visitLdcInsn(0x45D9F3B);
+                mv.visitInsn(IMUL);
+                mv.visitInsn(I2L);
+                mv.visitInsn(LRETURN);
 
-            mv.visitLabel(l1);
-            mv.visitVarInsn(ILOAD, 2);
-            mv.visitIntInsn(BIPUSH, 7);
-            mv.visitInsn(ISHL);
-            mv.visitInsn(I2L);
-            mv.visitLdcInsn(rng.nextLong());
-            mv.visitInsn(LXOR);
-            mv.visitInsn(LRETURN);
+                mv.visitLabel(l1);
+                mv.visitVarInsn(ILOAD, 2);
+                mv.visitIntInsn(BIPUSH, 7);
+                mv.visitInsn(ISHL);
+                mv.visitInsn(I2L);
+                mv.visitLdcInsn(rng.nextLong());
+                mv.visitInsn(LXOR);
+                mv.visitInsn(LRETURN);
 
-            mv.visitLabel(l2);
-            mv.visitLdcInsn(DECOY_STRINGS[rng.nextInt(DECOY_STRINGS.length)]);
-            mv.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "hashCode", "()I", false);
-            mv.visitInsn(I2L);
-            mv.visitInsn(LRETURN);
+                mv.visitLabel(l2);
+                mv.visitLdcInsn(DECOY_STRINGS[rng.nextInt(DECOY_STRINGS.length)]);
+                mv.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "hashCode", "()I", false);
+                mv.visitInsn(I2L);
+                mv.visitInsn(LRETURN);
 
-            mv.visitLabel(ld);
-            mv.visitMethodInsn(INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false);
-            mv.visitLdcInsn(rng.nextLong());
-            mv.visitInsn(LXOR);
-            mv.visitLabel(tEnd);
-            mv.visitInsn(LRETURN);
+                mv.visitLabel(ld);
+                mv.visitMethodInsn(INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false);
+                mv.visitLdcInsn(rng.nextLong());
+                mv.visitInsn(LXOR);
+                mv.visitLabel(tEnd);
+                mv.visitInsn(LRETURN);
+            }
 
             mv.visitLabel(tCatch);
             mv.visitInsn(POP);
             mv.visitLdcInsn(rng.nextLong());
             mv.visitInsn(LRETURN);
 
-            mv.visitMaxs(4, 4);
+            mv.visitMaxs(4, 6);
             mv.visitEnd();
         }
 

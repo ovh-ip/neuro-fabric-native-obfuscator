@@ -19,12 +19,15 @@ public final class ObfuscationConfig {
     private Path inputJar;
     private Path outputJar;
     private Path outputDll;
+    private Path cmakeOutDir;
+    private Path prebuiltNativesDir;
     private Path jdkHome;
     private String compilerPath;
     private String stripPath;
 
     private ProtectionTier tier = ProtectionTier.STRONG;
     private boolean useAnnotations = false;
+    private boolean buildWithCmake = false;
     private boolean embedDll = true;
     private boolean encryptEmbeddedDll = false;
     private boolean fuckedClasses = true;
@@ -43,6 +46,17 @@ public final class ObfuscationConfig {
     private int methodsPerShard = 32;
     private long seed = new SecureRandom().nextLong();
 
+    // Spring license / session server binding
+    private String serverUrl;
+    private String serverPubKeyHex;
+    private String productId;
+    private String buildId;
+    private String serverKeyFile = "hydro.key";
+    private String bakedLicenseKey;
+    private Path manifestOut;
+    private String serverAdminToken;
+    private int serverHeartbeatSec = 15;
+
     private final List<String> includePatterns = new ArrayList<>();
     private final List<String> excludePatterns = new ArrayList<>();
     private final List<String> vmIncludePatterns = new ArrayList<>();
@@ -57,8 +71,17 @@ public final class ObfuscationConfig {
     public Path getOutputDll() { return outputDll; }
     public void setOutputDll(Path outputDll) { this.outputDll = outputDll; }
 
+    public Path getCmakeOutDir() { return cmakeOutDir; }
+    public void setCmakeOutDir(Path cmakeOutDir) { this.cmakeOutDir = cmakeOutDir; }
+
+    public Path getPrebuiltNativesDir() { return prebuiltNativesDir; }
+    public void setPrebuiltNativesDir(Path prebuiltNativesDir) { this.prebuiltNativesDir = prebuiltNativesDir; }
+
     public Path getJdkHome() { return jdkHome; }
     public void setJdkHome(Path jdkHome) { this.jdkHome = jdkHome; }
+
+    public boolean isBuildWithCmake() { return buildWithCmake; }
+    public void setBuildWithCmake(boolean buildWithCmake) { this.buildWithCmake = buildWithCmake; }
 
     public String getCompilerPath() { return compilerPath; }
     public void setCompilerPath(String compilerPath) { this.compilerPath = compilerPath; }
@@ -116,6 +139,38 @@ public final class ObfuscationConfig {
 
     public long getSeed() { return seed; }
     public void setSeed(long seed) { this.seed = seed; }
+
+    public String getServerUrl() { return serverUrl; }
+    public void setServerUrl(String serverUrl) { this.serverUrl = serverUrl; }
+
+    public String getServerPubKeyHex() { return serverPubKeyHex; }
+    public void setServerPubKeyHex(String serverPubKeyHex) { this.serverPubKeyHex = serverPubKeyHex; }
+
+    public String getProductId() { return productId; }
+    public void setProductId(String productId) { this.productId = productId; }
+
+    public String getBuildId() { return buildId; }
+    public void setBuildId(String buildId) { this.buildId = buildId; }
+
+    public String getServerKeyFile() { return serverKeyFile; }
+    public void setServerKeyFile(String serverKeyFile) { this.serverKeyFile = serverKeyFile; }
+
+    public String getBakedLicenseKey() { return bakedLicenseKey; }
+    public void setBakedLicenseKey(String bakedLicenseKey) { this.bakedLicenseKey = bakedLicenseKey; }
+
+    public Path getManifestOut() { return manifestOut; }
+    public void setManifestOut(Path manifestOut) { this.manifestOut = manifestOut; }
+
+    public String getServerAdminToken() { return serverAdminToken; }
+    public void setServerAdminToken(String serverAdminToken) { this.serverAdminToken = serverAdminToken; }
+
+    public int getServerHeartbeatSec() { return serverHeartbeatSec; }
+    public void setServerHeartbeatSec(int serverHeartbeatSec) { this.serverHeartbeatSec = Math.max(1, serverHeartbeatSec); }
+
+    public boolean isServerEnabled() {
+        return serverUrl != null && !serverUrl.isBlank()
+                && serverPubKeyHex != null && !serverPubKeyHex.isBlank();
+    }
 
     public List<String> getIncludePatterns() { return includePatterns; }
     public List<String> getExcludePatterns() { return excludePatterns; }

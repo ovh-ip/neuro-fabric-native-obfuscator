@@ -77,10 +77,14 @@ public final class VmIsa {
 
     public final Map<Op, Integer> opcodeMap = new EnumMap<>(Op.class);
     public final long keySeed;
+    public final long streamMixMul;
+    public final long streamMixConst;
     public final int immKey32;
 
     public VmIsa(Random rng) {
         this.keySeed = rng.nextLong();
+        this.streamMixMul = (rng.nextLong() ^ 0xBF58476D1CE4E5B9L) | 1L;
+        this.streamMixConst = rng.nextLong() ^ 0x94D049BB133111EBL;
         this.immKey32 = rng.nextInt();
         List<Integer> pool = new ArrayList<>(256);
         for (int i = 0; i < 256; i++) pool.add(i);

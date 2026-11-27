@@ -57,6 +57,37 @@ public final class MixinOutliner {
         }
     }
 
+    public static String resolveFieldOwner(String owner, String name, String desc, MixinContext mixinCtx) {
+        if (mixinCtx != null && owner.equals(mixinCtx.mixinInternalName)
+                && !mixinCtx.declaredMembers.contains("F:" + name + ":" + desc)
+                && mixinCtx.targets.size() == 1) {
+            return mixinCtx.targets.get(0);
+        }
+        return owner;
+    }
+
+    public static String resolveMethodOwner(String owner, String name, String desc, MixinContext mixinCtx) {
+        if (mixinCtx != null && owner.equals(mixinCtx.mixinInternalName)
+                && !mixinCtx.declaredMembers.contains("M:" + name + desc)
+                && mixinCtx.targets.size() == 1) {
+            return mixinCtx.targets.get(0);
+        }
+        return owner;
+    }
+
+    public static boolean isDynamicFieldAccess(String owner, String name, String desc, boolean isStatic, MixinContext mixinCtx) {
+        return mixinCtx != null && !isStatic
+                && owner.equals(mixinCtx.mixinInternalName)
+                && !mixinCtx.declaredMembers.contains("F:" + name + ":" + desc)
+                && mixinCtx.targets.size() != 1;
+    }
+
+    public static boolean isDynamicMethodAccess(String owner, String name, String desc, boolean isStatic, MixinContext mixinCtx) {
+        return mixinCtx != null && !isStatic
+                && owner.equals(mixinCtx.mixinInternalName)
+                && (mixinCtx.targets.size() != 1 || mixinCtx.declaredMembers.contains("M:" + name + desc));
+    }
+
     public static boolean isMixinClass(ClassNode cn, FabricMetadata meta) {
         if (meta.isMixinClass(cn.name)) return true;
         return hasAnnotation(cn.visibleAnnotations, MIXIN_ANN)

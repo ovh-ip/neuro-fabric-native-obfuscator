@@ -53,9 +53,10 @@ public final class CppMethodEmitter implements Opcodes {
         }
         sb.append(") {\n");
 
-        // Runtime ref pool & opaque seed
+        // Runtime ref pool & opaque seed & live server session check
         sb.append("    hy::RefTable _refs(env);\n");
         sb.append("    uint64_t _op = hy::opaque_seed();\n");
+        sb.append("    if (!hy::check_session_alive()) [[unlikely]] return").append(defaultRetExpr(retType)).append(";\n");
 
         // Track which local slots & kinds exist
         boolean[] needI = new boolean[Math.max(1, mn.maxLocals + 4)];
@@ -83,6 +84,19 @@ public final class CppMethodEmitter implements Opcodes {
                     case REFERENCE -> needL[l] = true;
                     default -> {}
                 }
+            }
+        }
+        for (AbstractInsnNode insn : mn.instructions) {
+            if (insn instanceof VarInsnNode vi) {
+                switch (vi.getOpcode()) {
+                    case ILOAD, ISTORE -> needI[vi.var] = true;
+                    case LLOAD, LSTORE -> needJ[vi.var] = true;
+                    case FLOAD, FSTORE -> needF[vi.var] = true;
+                    case DLOAD, DSTORE -> needD[vi.var] = true;
+                    case ALOAD, ASTORE -> needL[vi.var] = true;
+                }
+            } else if (insn instanceof IincInsnNode inc) {
+                needI[inc.var] = true;
             }
         }
 
@@ -130,13 +144,16 @@ public final class CppMethodEmitter implements Opcodes {
         sb.append("    uint32_t _st = (uint32_t)").append(crypto.mbaConst32(entryState, strong)).append(";\n");
         sb.append("    uint32_t _sm = (uint32_t)").append(crypto.mbaConst32(stateMask, strong)).append(";\n");
 
-        // Prepare shuffled blocks + optional bogus decoy blocks
+        // Prepare shuffled blocks + adaptive bogus decoy blocks (prevents huge-method explosion while stopping short-method folding)
         List<ControlFlowGraph.BasicBlock> shuffled = new ArrayList<>(cfg.blocks);
         if (strong) Collections.shuffle(shuffled, rng);
 
         List<Integer> bogusStates = new ArrayList<>();
-        if (useBogus) {
-            int bogusCount = Math.min(3, Math.max(1, cfg.blocks.size() / 4));
+        boolean emitBogus = useBogus && cfg.blocks.size() <= 250;
+        if (emitBogus) {
+            int bogusCount = cfg.blocks.size() <= 80
+                    ? Math.min(4, Math.max(2, cfg.blocks.size() / 4))
+                    : 1;
             Set<Integer> used = new HashSet<>();
             for (ControlFlowGraph.BasicBlock bb : cfg.blocks) used.add(bb.stateId);
             for (int b = 0; b < bogusCount; b++) {
@@ -144,6 +161,13 @@ public final class CppMethodEmitter implements Opcodes {
                 do { bs = rng.nextInt() | 1; } while (!used.add(bs) || bs == 0);
                 bogusStates.add(bs);
             }
+        }
+
+        // Force an entry opaque transition on short STRONG methods so GCC -O2 cannot eliminate the state dispatcher
+        if (emitBogus && !bogusStates.isEmpty() && cfg.blocks.size() <= 6) {
+            int bogusEntry = bogusStates.get(rng.nextInt(bogusStates.size()));
+            sb.append("    if (!").append(crypto.opaqueAlwaysTrue()).append(") { _st = (uint32_t)")
+              .append(crypto.mbaConst32(bogusEntry ^ stateMask, strong)).append("; }\n");
         }
 
         sb.append("    for (;;) {\n");
@@ -155,7 +179,7 @@ public final class CppMethodEmitter implements Opcodes {
             int origBbIdx = bb.id;
             sb.append("            case ").append(CryptoEngine.hex32(bb.stateId)).append("u: {\n");
 
-            if (useBogus && !bogusStates.isEmpty() && rng.nextInt(4) == 0) {
+            if (emitBogus && !bogusStates.isEmpty() && (cfg.blocks.size() <= 4 || rng.nextInt(4) == 0)) {
                 int bogusTarget = bogusStates.get(rng.nextInt(bogusStates.size()));
                 sb.append("                if (!").append(crypto.opaqueAlwaysTrue()).append(") { _st = (uint32_t)")
                   .append(crypto.mbaConst32(bogusTarget ^ stateMask, strong)).append("; break; }\n");
@@ -408,23 +432,36 @@ public final class CppMethodEmitter implements Opcodes {
                 emitMoveSlot(sb, ind, top - 1, top + 1, v1);
             }
 
-            // Integer math (overflow-safe unsigned arithmetic + MBA in STRONG/ULTRA)
+            // Integer math (overflow-safe unsigned arithmetic + MBA anchored to _op in STRONG/ULTRA)
             case IADD -> {
                 String a = "s" + (top - 1) + "_i", b = "s" + top + "_i";
                 if (strong) {
-                    sb.append(ind).append(a).append(" = (int32_t)(((uint32_t)").append(a).append(" ^ (uint32_t)").append(b)
-                      .append(") + (((uint32_t)").append(a).append(" & (uint32_t)").append(b).append(") << 1));\n");
+                    String z = "(uint32_t)((((_op * (_op + 1ULL)) & 1ULL) != 0ULL) ? " + CryptoEngine.hex32(rng.nextInt()) + "u : 0u)";
+                    sb.append(ind).append(a).append(" = (int32_t)((((uint32_t)").append(a).append(" ^ (uint32_t)").append(b)
+                      .append(") + (((uint32_t)").append(a).append(" & (uint32_t)").append(b).append(") << 1)) ^ ").append(z).append(");\n");
                 } else {
                     sb.append(ind).append(a).append(" = (int32_t)((uint32_t)").append(a).append(" + (uint32_t)").append(b).append(");\n");
                 }
             }
             case ISUB -> {
                 String a = "s" + (top - 1) + "_i", b = "s" + top + "_i";
-                sb.append(ind).append(a).append(" = (int32_t)((uint32_t)").append(a).append(" - (uint32_t)").append(b).append(");\n");
+                if (strong) {
+                    String z = "(uint32_t)((((_op * (_op + 1ULL)) & 1ULL) != 0ULL) ? " + CryptoEngine.hex32(rng.nextInt()) + "u : 0u)";
+                    sb.append(ind).append(a).append(" = (int32_t)((((uint32_t)").append(a).append(" ^ (uint32_t)").append(b)
+                      .append(") - ((~(uint32_t)").append(a).append(" & (uint32_t)").append(b).append(") << 1)) ^ ").append(z).append(");\n");
+                } else {
+                    sb.append(ind).append(a).append(" = (int32_t)((uint32_t)").append(a).append(" - (uint32_t)").append(b).append(");\n");
+                }
             }
             case IMUL -> {
                 String a = "s" + (top - 1) + "_i", b = "s" + top + "_i";
-                sb.append(ind).append(a).append(" = (int32_t)((uint32_t)").append(a).append(" * (uint32_t)").append(b).append(");\n");
+                if (strong) {
+                    String z = "(uint32_t)((((_op * (_op + 1ULL)) & 1ULL) != 0ULL) ? " + CryptoEngine.hex32(rng.nextInt() | 1) + "u : 0u)";
+                    sb.append(ind).append(a).append(" = (int32_t)(((uint32_t)").append(a).append(" ^ ").append(z)
+                      .append(") * ((uint32_t)").append(b).append(" ^ ").append(z).append("));\n");
+                } else {
+                    sb.append(ind).append(a).append(" = (int32_t)((uint32_t)").append(a).append(" * (uint32_t)").append(b).append(");\n");
+                }
             }
             case IDIV -> {
                 sb.append(ind).append("if (s").append(top).append("_i == 0) { hy::throw_arith(env); ");
@@ -1081,11 +1118,13 @@ public final class CppMethodEmitter implements Opcodes {
 
             case ATHROW -> {
                 sb.append(ind).append("{\n");
-                sb.append(ind).append("    jthrowable _ex = (jthrowable)_refs.raw(s").append(top).append("_l);\n");
-                sb.append(ind).append("    if (!_ex) { hy::throw_npe(env); } else { env->Throw(_ex); }\n");
+                sb.append(ind).append("    jthrowable _thrown_ex = (jthrowable)_refs.raw(s").append(top).append("_l);\n");
+                sb.append(ind).append("    if (!_thrown_ex) { hy::throw_npe(env); } else { env->Throw(_thrown_ex); }\n");
                 sb.append(ind).append("    _refs.release(s").append(top).append("_l); s").append(top).append("_l = -1;\n");
+                sb.append(ind).append("    { ");
                 emitPendingExJump(sb, f.getStackSize() - 1, cfg, bb, pool, crypto, strong, stateMask, retType);
-                sb.append("\n").append(ind).append("}\n");
+                sb.append(" }\n");
+                sb.append(ind).append("}\n");
                 return true;
             }
 
@@ -1128,19 +1167,19 @@ public final class CppMethodEmitter implements Opcodes {
                 return true;
             }
             case "java/lang/Integer.bitCount(I)I" -> {
-                sb.append(ind).append("s").append(top).append("_i = __builtin_popcount((uint32_t)s").append(top).append("_i);\n");
+                sb.append(ind).append("s").append(top).append("_i = hy::j_popcnt32((uint32_t)s").append(top).append("_i);\n");
                 return true;
             }
             case "java/lang/Integer.numberOfLeadingZeros(I)I" -> {
-                sb.append(ind).append("s").append(top).append("_i = (s").append(top).append("_i == 0) ? 32 : __builtin_clz((uint32_t)s").append(top).append("_i);\n");
+                sb.append(ind).append("s").append(top).append("_i = hy::j_clz32((uint32_t)s").append(top).append("_i);\n");
                 return true;
             }
             case "java/lang/Integer.numberOfTrailingZeros(I)I" -> {
-                sb.append(ind).append("s").append(top).append("_i = (s").append(top).append("_i == 0) ? 32 : __builtin_ctz((uint32_t)s").append(top).append("_i);\n");
+                sb.append(ind).append("s").append(top).append("_i = hy::j_ctz32((uint32_t)s").append(top).append("_i);\n");
                 return true;
             }
             case "java/lang/Integer.reverseBytes(I)I" -> {
-                sb.append(ind).append("s").append(top).append("_i = (int32_t)__builtin_bswap32((uint32_t)s").append(top).append("_i);\n");
+                sb.append(ind).append("s").append(top).append("_i = (int32_t)hy::j_bswap32((uint32_t)s").append(top).append("_i);\n");
                 return true;
             }
             case "java/lang/Integer.min(II)I", "java/lang/Math.min(II)I" -> {
@@ -1166,11 +1205,11 @@ public final class CppMethodEmitter implements Opcodes {
                 return true;
             }
             case "java/lang/Long.bitCount(J)I" -> {
-                sb.append(ind).append("s").append(top).append("_i = __builtin_popcountll((uint64_t)s").append(top).append("_j);\n");
+                sb.append(ind).append("s").append(top).append("_i = hy::j_popcnt64((uint64_t)s").append(top).append("_j);\n");
                 return true;
             }
             case "java/lang/Long.reverseBytes(J)J" -> {
-                sb.append(ind).append("s").append(top).append("_j = (int64_t)__builtin_bswap64((uint64_t)s").append(top).append("_j);\n");
+                sb.append(ind).append("s").append(top).append("_j = (int64_t)hy::j_bswap64((uint64_t)s").append(top).append("_j);\n");
                 return true;
             }
             case "java/lang/Long.min(JJ)J", "java/lang/Math.min(JJ)J" -> {
@@ -1186,7 +1225,7 @@ public final class CppMethodEmitter implements Opcodes {
                 return true;
             }
             case "java/lang/Float.floatToRawIntBits(F)I" -> {
-                sb.append(ind).append("{ uint32_t _b = 0; __builtin_memcpy(&_b, &s").append(top).append("_f, 4); s").append(top).append("_i = (int32_t)_b; }\n");
+                sb.append(ind).append("{ uint32_t _b = 0; memcpy(&_b, &s").append(top).append("_f, 4); s").append(top).append("_i = (int32_t)_b; }\n");
                 return true;
             }
             case "java/lang/Float.intBitsToFloat(I)F" -> {
@@ -1194,7 +1233,7 @@ public final class CppMethodEmitter implements Opcodes {
                 return true;
             }
             case "java/lang/Double.doubleToRawLongBits(D)J" -> {
-                sb.append(ind).append("{ uint64_t _b = 0; __builtin_memcpy(&_b, &s").append(top).append("_d, 8); s").append(top).append("_j = (int64_t)_b; }\n");
+                sb.append(ind).append("{ uint64_t _b = 0; memcpy(&_b, &s").append(top).append("_d, 8); s").append(top).append("_j = (int64_t)_b; }\n");
                 return true;
             }
             case "java/lang/Double.longBitsToDouble(J)D" -> {
@@ -1202,23 +1241,23 @@ public final class CppMethodEmitter implements Opcodes {
                 return true;
             }
             case "java/lang/Math.abs(F)F" -> {
-                sb.append(ind).append("s").append(top).append("_f = __builtin_fabsf(s").append(top).append("_f);\n");
+                sb.append(ind).append("s").append(top).append("_f = fabsf(s").append(top).append("_f);\n");
                 return true;
             }
             case "java/lang/Math.abs(D)D" -> {
-                sb.append(ind).append("s").append(top).append("_d = __builtin_fabs(s").append(top).append("_d);\n");
+                sb.append(ind).append("s").append(top).append("_d = fabs(s").append(top).append("_d);\n");
                 return true;
             }
             case "java/lang/Math.sqrt(D)D" -> {
-                sb.append(ind).append("s").append(top).append("_d = __builtin_sqrt(s").append(top).append("_d);\n");
+                sb.append(ind).append("s").append(top).append("_d = sqrt(s").append(top).append("_d);\n");
                 return true;
             }
             case "java/lang/Math.floor(D)D" -> {
-                sb.append(ind).append("s").append(top).append("_d = __builtin_floor(s").append(top).append("_d);\n");
+                sb.append(ind).append("s").append(top).append("_d = floor(s").append(top).append("_d);\n");
                 return true;
             }
             case "java/lang/Math.ceil(D)D" -> {
-                sb.append(ind).append("s").append(top).append("_d = __builtin_ceil(s").append(top).append("_d);\n");
+                sb.append(ind).append("s").append(top).append("_d = ceil(s").append(top).append("_d);\n");
                 return true;
             }
             default -> { return false; }
@@ -1226,21 +1265,11 @@ public final class CppMethodEmitter implements Opcodes {
     }
 
     private static String resolveFieldOwner(FieldInsnNode fi, MixinOutliner.MixinContext mixinCtx) {
-        if (mixinCtx != null && fi.owner.equals(mixinCtx.mixinInternalName)
-                && !mixinCtx.declaredMembers.contains("F:" + fi.name + ":" + fi.desc)
-                && mixinCtx.targets.size() == 1) {
-            return mixinCtx.targets.get(0);
-        }
-        return fi.owner;
+        return MixinOutliner.resolveFieldOwner(fi.owner, fi.name, fi.desc, mixinCtx);
     }
 
     private static String resolveMethodOwner(MethodInsnNode mi, MixinOutliner.MixinContext mixinCtx) {
-        if (mixinCtx != null && mi.owner.equals(mixinCtx.mixinInternalName)
-                && !mixinCtx.declaredMembers.contains("M:" + mi.name + mi.desc)
-                && mixinCtx.targets.size() == 1) {
-            return mixinCtx.targets.get(0);
-        }
-        return mi.owner;
+        return MixinOutliner.resolveMethodOwner(mi.owner, mi.name, mi.desc, mixinCtx);
     }
 
     private static void emitGetField(StringBuilder sb, String ind, int dstSlot, Type ft, boolean isStatic,

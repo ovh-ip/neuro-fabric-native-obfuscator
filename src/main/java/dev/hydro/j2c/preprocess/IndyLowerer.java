@@ -26,6 +26,7 @@ public final class IndyLowerer {
         List<MethodNode> generatedHelpers = new ArrayList<>();
         int indySeq = 0;
         int condySeq = 0;
+        int polySeq = 0;
 
         for (int mIdx = 0; mIdx < cn.methods.size(); mIdx++) {
             MethodNode mn = cn.methods.get(mIdx);
@@ -87,6 +88,30 @@ public final class IndyLowerer {
 
                     mn.instructions.set(insn, new MethodInsnNode(
                             Opcodes.INVOKESTATIC, cn.name, helperName, helperDesc, isInterface));
+                } else if (insn instanceof MethodInsnNode mi && isPolymorphicSignatureCall(mi)) {
+                    String helperName = "$hy_mh_" + (polySeq++);
+                    Type mt = Type.getMethodType(mi.desc);
+                    Type[] origArgs = mt.getArgumentTypes();
+                    Type[] fullArgs = new Type[origArgs.length + 1];
+                    fullArgs[0] = Type.getObjectType(mi.owner);
+                    System.arraycopy(origArgs, 0, fullArgs, 1, origArgs.length);
+                    String helperDesc = Type.getMethodDescriptor(mt.getReturnType(), fullArgs);
+
+                    MethodNode helper = new MethodNode(helperAccess, helperName, helperDesc, null, null);
+                    int slot = 0;
+                    for (Type arg : fullArgs) {
+                        helper.instructions.add(new VarInsnNode(arg.getOpcode(Opcodes.ILOAD), slot));
+                        slot += arg.getSize();
+                    }
+                    helper.instructions.add(new MethodInsnNode(mi.getOpcode(), mi.owner, mi.name, mi.desc, false));
+                    helper.instructions.add(new InsnNode(mt.getReturnType().getOpcode(Opcodes.IRETURN)));
+                    helper.maxStack = Math.max(4, slot + 2);
+                    helper.maxLocals = Math.max(1, slot);
+                    generatedHelpers.add(helper);
+                    nonNativeHelpers.add(helper);
+
+                    mn.instructions.set(insn, new MethodInsnNode(
+                            Opcodes.INVOKESTATIC, cn.name, helperName, helperDesc, isInterface));
                 }
                 insn = next;
             }
@@ -98,6 +123,14 @@ public final class IndyLowerer {
         return indy.bsm != null
                 && "java/lang/invoke/StringConcatFactory".equals(indy.bsm.getOwner())
                 && ("makeConcatWithConstants".equals(indy.bsm.getName()) || "makeConcat".equals(indy.bsm.getName()));
+    }
+
+    private static boolean isPolymorphicSignatureCall(MethodInsnNode mi) {
+        if (mi.getOpcode() != Opcodes.INVOKEVIRTUAL) return false;
+        if ("java/lang/invoke/MethodHandle".equals(mi.owner)) {
+            return "invoke".equals(mi.name) || "invokeExact".equals(mi.name) || "invokeBasic".equals(mi.name);
+        }
+        return "java/lang/invoke/VarHandle".equals(mi.owner);
     }
 
     private static boolean hasJsr(MethodNode mn) {
